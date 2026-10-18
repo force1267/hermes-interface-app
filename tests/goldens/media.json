@@ -1,0 +1,35 @@
+{
+  "fallback_text": "Photo",
+  "fragment_id": "f-media",
+  "kind": "media",
+  "mode": "standard",
+  "origin": "cached",
+  "tree": {
+    "children": [
+      {
+        "children": [],
+        "component": "Text",
+        "props": {
+          "text": "Photo"
+        }
+      },
+      {
+        "children": [],
+        "component": "Media",
+        "props": {
+          "alt": "A photo",
+          "asset_id": "a-photo-1",
+          "media_type": "image"
+        }
+      }
+    ],
+    "component": "Stack",
+    "props": {
+      "direction": "vertical"
+    }
+  },
+  "version": {
+    "major": 1,
+    "minor": 0
+  }
+}

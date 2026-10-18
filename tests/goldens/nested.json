@@ -1,0 +1,60 @@
+{
+  "fallback_text": "Nested layout",
+  "fragment_id": "f-nested",
+  "kind": "card-list",
+  "mode": "standard",
+  "origin": "builtin",
+  "tree": {
+    "children": [
+      {
+        "children": [
+          {
+            "children": [],
+            "component": "Text",
+            "props": {
+              "text": "Left"
+            }
+          },
+          {
+            "children": [],
+            "component": "Text",
+            "props": {
+              "text": "Right"
+            }
+          }
+        ],
+        "component": "Stack",
+        "props": {
+          "direction": "horizontal"
+        }
+      },
+      {
+        "children": [],
+        "component": "List",
+        "props": {
+          "items": [
+            "x",
+            "y"
+          ]
+        }
+      },
+      {
+        "children": [],
+        "component": "Button",
+        "props": {
+          "action_id": "a.more",
+          "intent": "generative",
+          "label": "More"
+        }
+      }
+    ],
+    "component": "Stack",
+    "props": {
+      "direction": "vertical"
+    }
+  },
+  "version": {
+    "major": 1,
+    "minor": 0
+  }
+}

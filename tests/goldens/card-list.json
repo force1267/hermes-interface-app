@@ -1,0 +1,45 @@
+{
+  "fallback_text": "Pick one",
+  "fragment_id": "f-cards",
+  "kind": "card-list",
+  "mode": "standard",
+  "origin": "generated",
+  "tree": {
+    "children": [
+      {
+        "children": [],
+        "component": "Text",
+        "props": {
+          "text": "Pick one"
+        }
+      },
+      {
+        "children": [],
+        "component": "List",
+        "props": {
+          "items": [
+            "Alpha",
+            "Beta"
+          ]
+        }
+      },
+      {
+        "children": [],
+        "component": "Button",
+        "props": {
+          "action_id": "a.choose",
+          "intent": "assigned",
+          "label": "Choose"
+        }
+      }
+    ],
+    "component": "Stack",
+    "props": {
+      "direction": "vertical"
+    }
+  },
+  "version": {
+    "major": 1,
+    "minor": 0
+  }
+}

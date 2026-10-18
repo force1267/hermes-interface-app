@@ -1,0 +1,56 @@
+{
+  "fallback_text": "Sign up",
+  "fragment_id": "f-form",
+  "kind": "form",
+  "mode": "standard",
+  "origin": "generated",
+  "tree": {
+    "children": [
+      {
+        "children": [],
+        "component": "Text",
+        "props": {
+          "text": "Sign up"
+        }
+      },
+      {
+        "children": [],
+        "component": "Field",
+        "props": {
+          "input": "text",
+          "label": "Email",
+          "name": "email",
+          "placeholder": "you@example.com",
+          "value": ""
+        }
+      },
+      {
+        "children": [],
+        "component": "Field",
+        "props": {
+          "input": "number",
+          "label": "Age",
+          "name": "age",
+          "value": 30
+        }
+      },
+      {
+        "children": [],
+        "component": "Button",
+        "props": {
+          "action_id": "a.submit",
+          "intent": "generative",
+          "label": "Submit"
+        }
+      }
+    ],
+    "component": "Stack",
+    "props": {
+      "direction": "vertical"
+    }
+  },
+  "version": {
+    "major": 1,
+    "minor": 0
+  }
+}

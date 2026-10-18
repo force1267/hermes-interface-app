@@ -1,0 +1,18 @@
+{
+  "fallback_text": "Hello golden text",
+  "fragment_id": "f-text",
+  "kind": "text",
+  "mode": "standard",
+  "origin": "generated",
+  "tree": {
+    "children": [],
+    "component": "Text",
+    "props": {
+      "text": "Hello golden text"
+    }
+  },
+  "version": {
+    "major": 1,
+    "minor": 0
+  }
+}
