@@ -110,7 +110,8 @@ def sandbox_config():
         "sandbox": "allow-scripts",
         "csp": {"default-src": "'none'", "connect-src": "'none'",
                 "form-action": "'none'", "object-src": "'none'",
-                "base-uri": "'none'", "frame-src": "'none'"},
+                "base-uri": "'none'", "frame-src": "'none'",
+                "navigate-to": "'none'"},
     }
 
 
@@ -121,7 +122,8 @@ def check_sandbox(config):
     csp = config.get("csp", {})
     for k, v in {"default-src": "'none'", "connect-src": "'none'",
                  "form-action": "'none'", "object-src": "'none'",
-                 "base-uri": "'none'", "frame-src": "'none'"}.items():
+                 "base-uri": "'none'", "frame-src": "'none'",
+                 "navigate-to": "'none'"}.items():
         if csp.get(k) != v:
             return (False, f"csp-denied:{k}")
     return (True, "ok")

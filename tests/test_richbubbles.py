@@ -241,3 +241,102 @@ class T_Sandbox(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class T_P2Repair(unittest.TestCase):
+    """Regression gate for t_e1371191: fail before repair, pass after."""
+
+    def long_text(self):
+        frag, _ = load_golden("text")
+        frag = json.loads(json.dumps(frag))
+        frag["tree"]["props"]["text"] = "LONG_SENTINEL " * 10000
+        return frag
+
+    def test_missing_budget_is_bounded_preview(self):
+        b = RichBubble(self.long_text(), budget=None)
+        r = b.resolve()
+        self.assertEqual(r["mode"], "standard")
+        self.assertEqual(r["render"], "preview")
+        self.assertLess(len(r["html"]), 2000)
+        self.assertLess(r["html"].count("LONG_SENTINEL"), 100)
+        self.assertIn('data-preview="truncated"', r["html"])
+        self.assertIn("max-height", r["html"])
+        self.assertIn("\u2026", r["html"])
+        self.assertIn('data-op="expand"', r["html"])
+
+    def test_invalid_budget_is_bounded_fallback(self):
+        b = RichBubble(self.long_text(), budget={"bogus": 1})
+        r = b.resolve()
+        self.assertEqual(r["render"], "fallback")
+        self.assertLess(len(r["html"]), 2000)
+        self.assertIn('data-preview="truncated"', r["html"])
+
+    def test_overflow_collapse_returns_to_bounded_preview(self):
+        b = RichBubble(self.long_text(), budget=BUDGET)
+        b.set_measured({"height_px": 500, "width_px": 50, "actions": 0,
+                        "focus_capture": False})
+        self.assertEqual(b.resolve()["mode"], "expanded")
+        b.expand()
+        self.assertEqual(b.resolve()["mode"], "expanded")
+        b.collapse()
+        r = b.resolve()
+        self.assertEqual(r["mode"], "standard")
+        self.assertLess(len(r["html"]), 2000)
+        self.assertIn('data-preview="truncated"', r["html"])
+
+    def test_user_expand_wins_over_missing_budget(self):
+        b = RichBubble(self.long_text(), budget=None)
+        b.expand()
+        r = b.resolve()
+        self.assertEqual(r["mode"], "expanded")
+        self.assertGreater(r["html"].count("LONG_SENTINEL"), 9000)
+
+    def test_unsent_form_values_rendered(self):
+        frag, _ = load_golden("form")
+        b = RichBubble(frag, budget=BUDGET,
+                       form_values={"email": "UNSENT_SENTINEL"},
+                       focus_target="email-field")
+        b.set_measured({"height_px": 10, "width_px": 10, "actions": 1,
+                        "focus_capture": False})
+        self.assertIn("UNSENT_SENTINEL", b.resolve()["html"])
+        self.assertIn("UNSENT_SENTINEL",
+                      render_tree(frag["tree"], "form",
+                                  {"email": "UNSENT_SENTINEL"}))
+
+    def test_csp_composition_dual_hash(self):
+        page = build_page("tok", "ctx", ("a.ok",))
+        self.assertIn("navigate-to 'none'", page)
+        outer = page.split(
+            'http-equiv="Content-Security-Policy" content="', 1)[1]
+        outer = outer.split('">', 1)[0]
+        self.assertEqual(outer.count("sha256-"), 3)  # 2 scripts + 1 style
+        srcdoc = frame_srcdoc("tok", "ctx", ("a.ok",))
+        self.assertIn("navigate-to 'none'", srcdoc)
+        self.assertEqual(srcdoc.count("sha256-"), 1)
+        self.assertNotIn("eval(", srcdoc)
+
+    def test_frame_bundle_has_no_navigation_primitives(self):
+        import p2rich.sandbox as sb
+        for bad in ("location", "window.open", "top.location",
+                    "document.write"):
+            self.assertNotIn(bad, sb.FRAME_JS)
+
+    def test_build_page_wires_bubbles_and_actions(self):
+        frag, _ = load_golden("form")
+        b = RichBubble(frag, budget=BUDGET, form_values={"email": "e@x.y"},
+                       focus_target="email-field")
+        page = build_page("tok", "ctx", ("a.submit",), bubbles=(b,))
+        self.assertEqual(frame_count_in_page(page), 1)
+        self.assertEqual(page.count("<article"), 1)
+        self.assertIn('id="act-a.submit"', page)
+        self.assertIn("P2_BUBBLES", page)
+        import p2rich.sandbox as sb
+        self.assertEqual(sb._js_data("</script><script>"),
+                         '"\\u003c/script>\\u003cscript>"')
+
+    def test_sandbox_config_requires_navigate_to(self):
+        cfg = sandbox_config()
+        self.assertEqual(cfg["csp"]["navigate-to"], "'none'")
+        bad = sandbox_config()
+        del bad["csp"]["navigate-to"]
+        self.assertFalse(check_sandbox(bad)[0])
