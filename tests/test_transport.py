@@ -86,7 +86,13 @@ class T_P1_Resume(unittest.TestCase):
             c.supported_versions = [V10]
             sess2 = c.connect(host, port, resume=True)
             self.assertEqual(sess2["mode"], "rich")
-            ids = [pin["id"] for pin in sess2["pins"]]
+            pins = sess2["pins"]
+            self.assertTrue(pins)
+            for pin in pins:
+                self.assertIsInstance(pin.get("fragment_id"), str)
+                self.assertTrue(pin["fragment_id"])
+                self.assertIsInstance(pin.get("fragment_version"), dict)
+            ids = [pin["id"] for pin in pins]
             self.assertIn("b1", ids)
             self.assertEqual(p.regen_count, regen_after_first)
             c.close()
@@ -134,11 +140,13 @@ class T_P1_Dedup(unittest.TestCase):
                 "a1", 0, payload.encode("utf-8"))
             c2._send_and_ack(env, payload, bubble_text="action:echo")
             self.assertEqual(p.dispatcher.effects, effects)
+            # E04: replay returns the exact saved result, not duplicate-inert
+            self.assertEqual(c2._last_result, t1)
+            self.assertTrue(str(t1).startswith("did:echo:"))
             # one logical bubble for a1, not two
             ids = [b["id"] for b in c2.bubbles]
             self.assertEqual(ids.count("a1"), 1)
             c2.close()
-            _ = t1
         finally:
             r.kill()
             p.stop()
@@ -259,6 +267,15 @@ class T_P1_FaultInjection(unittest.TestCase):
                 server_ids = p.acked_list()
                 self.assertEqual(client_ids, server_ids)
                 self.assertEqual(len(client_ids), len(set(client_ids)))
+                # content: no lost bubbles (empty text is a lost bubble)
+                for b in c.bubbles:
+                    self.assertTrue(b["text"],
+                                    msg=f"lost content: {b!r}")
+                # pre-kill bubbles keep exact text
+                pre = {b["id"]: b["text"] for b in c.bubbles
+                       if b["id"].startswith("pre-")}
+                for i in range(3):
+                    self.assertEqual(pre.get(f"pre-{i}"), f"pre-kill {i}")
                 # sensitivity: the comparison must catch loss and doubling
                 self.assertNotEqual(client_ids[:-1], server_ids)
                 self.assertNotEqual(client_ids + [client_ids[0]],

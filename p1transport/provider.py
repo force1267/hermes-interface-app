@@ -134,12 +134,34 @@ class Provider:
                                            self.server_caps,
                                            self.registry_revision)
         if sess["selected_version"] is not None:
-            # V05: re-pin compatible approved last-good without regenerating.
-            # Resume last_seen echoes back; last-good entries re-upgrade.
-            pins = list(sess["pins"])
-            seen_ids = {p.get("id") for p in pins}
+            # V04/V05: never echo null-fragment last_seen entries.
+            # Resolve each last_seen id against authoritative last_good and
+            # emit a pin only when a compatible approved entry exists.
+            last_seen = body.get("last_seen", []) or []
+            pins = []
+            seen_ids = set()
+            for entry in last_seen:
+                mid = (entry or {}).get("id")
+                if not isinstance(mid, str) or not mid:
+                    continue
+                seen_ids.add(mid)
+                frag = self.last_good.get(mid)
+                if frag is None:
+                    continue  # unresolvable: no pin, never null
+                if not isinstance(frag.get("fragment_id"), str):
+                    continue
+                if not isinstance(frag.get("fragment_version"), dict):
+                    continue
+                pins.append({"id": mid, "revision": frag["revision"],
+                             "fragment_id": frag["fragment_id"],
+                             "fragment_version":
+                                 dict(frag["fragment_version"])})
             for mid, frag in self.last_good.items():
                 if mid not in seen_ids:
+                    if not isinstance(frag.get("fragment_id"), str):
+                        continue
+                    if not isinstance(frag.get("fragment_version"), dict):
+                        continue
                     pins.append({"id": mid, "revision": frag["revision"],
                                  "fragment_id": frag["fragment_id"],
                                  "fragment_version":
@@ -147,6 +169,13 @@ class Provider:
             sess["pins"] = pins
             if pins and sess["mode"] == "rich":
                 sess["reason"] = "negotiated+re-pinned"
+            if not pins and last_seen:
+                # Resume history exists but nothing compatible approved:
+                # keep the V04 version selection, fall back to static
+                # text with the upgrade nudge per V05.
+                sess["mode"] = "text"
+                sess["reason"] = "upgrade-nudge:re-pin-unavailable"
+                sess["upgrade_available"] = True
         return protocol.mk_session(sess, msg_id=f"session-{body['client_id']}")
 
     def _handle_chat(self, env):
@@ -181,12 +210,20 @@ class Provider:
     def _accept_payload(self, msg_id, revision, body):
         """E02/E05 dedup + E04 action dedup. Returns a result envelope."""
         major = 1
-        verdict = self.rev.submit(msg_id, revision, major)
-        if verdict in ("stale", "duplicate-inert"):
-            return protocol.mk_result(f"get:{msg_id}:{revision}",
-                                      f"{verdict}:{msg_id}:{revision}",
-                                      msg_id=f"res-{msg_id}-{revision}-dup")
         if isinstance(body, dict) and "action_id" in body:
+            # E04: exact replay returns the saved correlated result with
+            # no new effect, even though (id,revision,major) is a dup.
+            req_id = body.get("request_id", f"get:{msg_id}:{revision}")
+            saved = self.dispatcher.results.get(req_id)
+            if saved is not None:
+                return protocol.mk_result(
+                    req_id, saved["text"],
+                    msg_id=f"res-{msg_id}-{revision}")
+            verdict = self.rev.submit(msg_id, revision, major)
+            if verdict in ("stale", "duplicate-inert"):
+                return protocol.mk_result(f"get:{msg_id}:{revision}",
+                                          f"{verdict}:{msg_id}:{revision}",
+                                          msg_id=f"res-{msg_id}-{revision}-dup")
             saved = self.dispatcher.dispatch(body["action_id"],
                                              body.get("values", {}),
                                              body.get("request_id",
@@ -197,6 +234,11 @@ class Provider:
                 body.get("request_id", msg_id), saved["text"],
                 msg_id=f"res-{msg_id}-{revision}")
         # plain text: generate last-good fragment once, reuse after (V05)
+        verdict = self.rev.submit(msg_id, revision, major)
+        if verdict in ("stale", "duplicate-inert"):
+            return protocol.mk_result(f"get:{msg_id}:{revision}",
+                                      f"{verdict}:{msg_id}:{revision}",
+                                      msg_id=f"res-{msg_id}-{revision}-dup")
         if msg_id not in self.last_good:
             self.last_good[msg_id] = {
                 "fragment_id": msg_id, "revision": revision,

@@ -64,9 +64,17 @@ class Client:
         """Resume + replay the outbox in order. Returns the session body."""
         self.close()
         sess = self.connect(host, port, resume=True)
-        for env, payload_str in list(self.outbox):
+        for entry in list(self.outbox):
+            if len(entry) == 3:
+                env, payload_str, saved_text = entry
+            else:
+                env, payload_str = entry
+                saved_text = ""
+            if not saved_text:
+                saved_text = self._infer_bubble_text(payload_str)
             try:
-                self._send_and_ack(env, payload_str)
+                self._send_and_ack(env, payload_str,
+                                   bubble_text=saved_text)
             except ConnectionLost:
                 break
         return sess
@@ -80,6 +88,22 @@ class Client:
                 pass
         self._sock = self._rfile = None
 
+    def _infer_bubble_text(self, payload_str, fallback=""):
+        try:
+            import json as _json
+            body = _json.loads(payload_str)
+        except Exception:
+            return fallback
+        if isinstance(body, dict):
+            if "action_id" in body:
+                try:
+                    return "action:%s" % body["action_id"]
+                except Exception:
+                    return fallback
+            t = body.get("text")
+            if isinstance(t, str):
+                return t
+        return fallback
     # -- sending --
     def _next_req(self):
         self._req_seq += 1
@@ -109,8 +133,12 @@ class Client:
         return self._last_result
 
     def _send_and_ack(self, env, payload_str, bubble_text=""):
-        entry = (env, payload_str)
-        if entry not in self.outbox:
+        if not bubble_text:
+            bubble_text = self._infer_bubble_text(payload_str)
+        entry = (env, payload_str, bubble_text)
+        if not any(e[0]["id"] == env["id"]
+                   and e[0]["revision"] == env["revision"]
+                   for e in self.outbox):
             self.outbox.append(entry)
         try:
             reply = self._roundtrip(env, expect="payload.get")

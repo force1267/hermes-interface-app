@@ -164,6 +164,27 @@ class T_ChatFallback(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["text"], "two")
 
+    def test_corrupt_newer_update_keeps_good_text(self):
+        surf = ChatSurface("d")
+        surf.on_session(dict(RICH))
+        env, pay = text_env("update", "good", revision=0)
+        surf.ingest(env, pay)
+        bad = b"not json"
+        bad_env = protocol.mk_text_envelope(
+            "update", 1, bad, fallback="bad fallback")
+        surf.ingest(bad_env, bad)
+        row = surf.rendered_bubbles()[0]
+        self.assertEqual(row["text"], "good")
+        self.assertTrue(row.get("warning"))
+
+    def test_stale_outgoing_cannot_replace_newer(self):
+        surf = ChatSurface("d")
+        surf.on_session(dict(RICH))
+        surf.ingest_sent("stale", "new", revision=2)
+        surf.ingest_sent("stale", "old", revision=1)
+        rows = surf.rendered_bubbles()
+        self.assertEqual(rows[0]["text"], "new")
+
 
 class T_ChatComposer(unittest.TestCase):
     def test_send_when_text_voice_when_empty(self):

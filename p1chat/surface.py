@@ -103,6 +103,15 @@ class ChatSurface:
         text, render, reason = self._resolve(norm, payload_bytes)
         existing = self._by_id.get(msg_id)
         if existing is not None:
+            if render == "fallback" and existing.get("render") == "text" \
+                    and reason in ("missing-payload", "hash-mismatch",
+                                   "payload-bad-json",
+                                   "payload-validation:bad-text"):
+                # E05 corrupt update: keep previous good representation
+                # with a warning; do not commit the bad update.
+                existing["warning"] = (f"bad-update-kept-{revision}:"
+                                       f"{reason}")
+                return existing
             # Newer revision replaces in place; position kept, warning out.
             existing.update({"revision": revision, "major": major,
                              "text": text, "render": render,
@@ -157,7 +166,22 @@ class ChatSurface:
         key = (msg_id, revision, major)
         if key in self._seen:
             return self._by_id[msg_id]
-        self._rev.submit(msg_id, revision, major)
+        verdict = self._rev.submit(msg_id, revision, major)
+        if verdict == "stale":
+            # E05: a stale outgoing revision cannot replace newer text.
+            cur = self._by_id.get(msg_id)
+            if cur is not None:
+                cur["warning"] = (f"stale-revision:{revision}"
+                                  f"-kept-{cur['revision']}")
+                return cur
+            bubble = {"id": msg_id, "revision": revision, "major": major,
+                      "text": text, "render": "text", "reason": None,
+                      "warning": f"stale-revision:{revision}-no-good"}
+            self._bubbles.append(bubble)
+            self._by_id[msg_id] = bubble
+            return bubble
+        if verdict == "duplicate-inert":
+            return self._by_id[msg_id]
         self._seen.add(key)
         existing = self._by_id.get(msg_id)
         if existing is not None and existing["revision"] == revision:
