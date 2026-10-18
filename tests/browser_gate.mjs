@@ -1,7 +1,9 @@
 // Committed P2 browser gate: re-runnable, zero dependencies (raw CDP only).
 //
 // Usage:
-//   node tests/browser_gate.mjs <page.html> <chrome-bin> <user-data-dir> <port>
+//   node tests/browser_gate.mjs <page.html> <chrome-bin> <user-data-dir> [port|0]
+// Port 0 (or omitted) allocates an isolated ephemeral debug port owned by
+// this run; a nonzero port is used as-is after a fail-fast occupancy check.
 //
 // The page is built by tests/test_browser_gate.py via p2rich.sandbox
 // build_page() with a form bubble (focus_target=act-a.submit) and a long
@@ -19,9 +21,13 @@
 import { spawn } from 'node:child_process';
 
 const [pagePath, chromeBin, userDir, portArg] = process.argv.slice(2);
-const port = Number(portArg || 19340);
+// Port 0 (or omitted) = ephemeral: chrome picks a free debug port and this
+// script learns it from OUR child's stderr, so parallel/repeated runs can
+// never share (or steal) a stale browser. A nonzero port keeps the old
+// behaviour but fails fast if something already listens on it.
+let port = Number(portArg || 0);
 if (!pagePath || !chromeBin || !userDir) {
-  console.log('usage: node browser_gate.mjs <page.html> <chrome-bin> <user-data-dir> <port>');
+  console.log('usage: node browser_gate.mjs <page.html> <chrome-bin> <user-data-dir> [port|0]');
   process.exit(2);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -31,13 +37,75 @@ function gate(name, cond, extra) {
   else { console.log('FAIL ' + name + (extra !== undefined ? ' :: ' + extra : '')); failures.push(name); }
 }
 
-const chrome = spawn(chromeBin, ['--headless', '--no-sandbox',
-  '--disable-site-isolation-trials',
-  '--disable-features=IsolateOrigins,site-per-process',
-  '--remote-debugging-port=' + port, '--remote-allow-origins=*',
-  '--user-data-dir=' + userDir, 'about:blank']);
+function spawnChrome(debugPort) {
+  const c = spawn(chromeBin, ['--headless', '--no-sandbox',
+    '--disable-site-isolation-trials',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--remote-debugging-port=' + debugPort, '--remote-allow-origins=*',
+    '--user-data-dir=' + userDir, 'about:blank'],
+    { stdio: ['ignore', 'ignore', 'pipe'] });
+  c.on('error', () => {});
+  c.stderr.on('data', (d) => process.stderr.write(d));
+  return c;
+}
+// Ephemeral-port discovery: the "DevTools listening on ws://...:PORT/..."
+// line comes from our own child's stderr, so the port is provably ours.
+function waitForDevToolsPort(child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const done = (fn, v) => { clearTimeout(t); child.stderr.off('data', onData); fn(v); };
+    const t = setTimeout(() => done(reject,
+      Error('devtools-port-timeout :: ' + buf.slice(-300))), timeoutMs);
+    const onData = (d) => {
+      buf += String(d);
+      const m = buf.match(/DevTools listening on ws:\/\/[^\s:]+:(\d+)\//);
+      if (m) done(resolve, Number(m[1]));
+    };
+    child.stderr.on('data', onData);
+    child.on('error', (e) => done(reject, e));
+    child.on('exit', (code) => done(reject,
+      Error('chrome-exited-early:' + code + ' :: ' + buf.slice(-300))));
+  });
+}
+async function assertPortFree(p) {
+  try {
+    const r = await fetch('http://127.0.0.1:' + p + '/json/version');
+    if (r.ok) throw Error('debug port ' + p + ' already owned by another browser; refusing to attach');
+  } catch (e) {
+    if (String(e && e.message || e).includes('already owned')) throw e;
+    // connection refused = free, as required
+  }
+}
+let chrome = null;
+async function cleanup() {
+  try { if (ws && ws.readyState === 1) ws.close(); } catch {}
+  await sleep(200);
+  if (chrome && chrome.exitCode === null) {
+    chrome.kill('SIGTERM');
+    await new Promise((r) => {
+      const t = setTimeout(r, 5000);
+      chrome.once('exit', () => { clearTimeout(t); r(); });
+    });
+    if (chrome.exitCode === null) {
+      try { chrome.kill('SIGKILL'); } catch {}
+      await new Promise((r) => {
+        const t = setTimeout(r, 5000);
+        chrome.once('exit', () => { clearTimeout(t); r(); });
+      });
+    }
+  }
+}
 let ws = null;
+let exitCode = 1;
 try {
+  if (!port) {
+    chrome = spawnChrome(0);
+    port = await waitForDevToolsPort(chrome, 20000);
+    console.log('PASS isolated debug port ' + port);
+  } else {
+    await assertPortFree(port);
+    chrome = spawnChrome(port);
+  }
   let tabs;
   for (let i = 0; i < 100; i++) {
     try { tabs = await (await fetch('http://127.0.0.1:' + port + '/json')).json(); break; }
@@ -45,7 +113,11 @@ try {
   }
   if (!tabs) throw Error('no debuggable tabs');
   ws = new WebSocket(tabs.find((t) => t.type === 'page').webSocketDebuggerUrl);
-  await new Promise((r) => { ws.onopen = r; });
+  await new Promise((res, rej) => {
+    const t = setTimeout(() => rej(Error('ws-open-timeout')), 15000);
+    ws.onopen = () => { clearTimeout(t); res(); };
+    ws.onerror = (e) => { clearTimeout(t); rej(e); };
+  });
   let id = 0; const pending = new Map();
   const netReqs = [];
   ws.onmessage = (e) => {
@@ -54,10 +126,19 @@ try {
     if (m.method === 'Network.requestWillBeSent') netReqs.push(m.params.request.url);
     if (m.method === 'Runtime.executionContextCreated') contexts.push(m.params.context);
   };
-  const call = (method, params = {}) => new Promise((resolve, reject) => {
+  // Every CDP round-trip carries a deadline so a wedged browser fails loudly
+  // instead of hanging the gate (and the unittest runner) forever.
+  const call = (method, params = {}, timeoutMs = 15000) => new Promise((resolve, reject) => {
     const n = ++id;
-    pending.set(n, (x) => x.error ? reject(Error(JSON.stringify(x.error))) : resolve(x.result));
-    ws.send(JSON.stringify({ id: n, method, params }));
+    const t = setTimeout(() => {
+      if (pending.has(n)) { pending.delete(n); reject(Error('cdp-timeout:' + method)); }
+    }, timeoutMs);
+    pending.set(n, (x) => {
+      clearTimeout(t);
+      x.error ? reject(Error(JSON.stringify(x.error))) : resolve(x.result);
+    });
+    try { ws.send(JSON.stringify({ id: n, method, params })); }
+    catch (e) { clearTimeout(t); pending.delete(n); reject(e); }
   });
   const contexts = [];
   await call('Page.enable'); await call('Runtime.enable'); await call('Network.enable');
@@ -69,6 +150,9 @@ try {
   const topId = tree0.frameTree.frame.id;
   const kids0 = tree0.frameTree.childFrames || [];
   gate('single reusable frame', kids0.length === 1, JSON.stringify(kids0.length));
+  gate('driving owned browser (top url is our page)',
+    tree0.frameTree.frame.url === 'file://' + pagePath,
+    tree0.frameTree.frame.url);
   const fid = kids0[0].frame.id;
   const fctx = contexts.findLast((c) => c.auxData?.frameId === fid && c.auxData?.isDefault)?.id;
   const pctx = contexts.findLast((c) => c.auxData?.frameId === topId && c.auxData?.isDefault)?.id;
@@ -251,6 +335,73 @@ try {
   gate('tab trapped inside takeover',
     wrapResult && wrapResult.lastOk && wrapResult.nowFirst, JSON.stringify(wrapResult));
 
+  // --- real expanded-frame action dispatch: a genuine user click INSIDE the
+  // frame (not a debugger-injected parent message) must run one registered
+  // action; an unregistered id must stay silent.
+  await post(M({ token: tok, context: ctxName, op: 'render',
+    payload: { tree: { component: 'Button', props: { label: 'submit',
+      action_id: 'a.submit', intent: 'assigned' }, children: [] },
+      kind: 'form', fragment_id: 'gate-btn' } }));
+  await lastStatus();
+  await ev('responses=[]');
+  await ev('document.querySelector("#r button").click()', fctx);
+  await sleep(400);
+  gate('frame button click dispatches action-ok',
+    String(await ev('responses[responses.length-1]&&responses[responses.length-1].status'))
+      .startsWith('action-ok'));
+  await ev('responses=[]');
+  await post(M({ token: tok, context: ctxName, op: 'render',
+    payload: { tree: { component: 'Button', props: { label: 'evil',
+      action_id: 'a.evil', intent: 'assigned' }, children: [] },
+      kind: 'form', fragment_id: 'gate-btn' } }));
+  await lastStatus();
+  await ev('responses=[]');
+  await ev('document.querySelector("#r button").click()', fctx);
+  await sleep(400);
+  const evilStatus = await ev('responses[responses.length-1]&&responses[responses.length-1].status');
+  gate('frame button unregistered click stays silent (no action-ok)',
+    !String(evilStatus).startsWith('action-ok'), String(evilStatus));
+  await ev('responses=[]');
+
+  // --- typed state round-trips: number (incl. zero + cleared), text, boolean
+  const fieldRender = (name, label, input, value, fid2) => post(M({ token: tok,
+    context: ctxName, op: 'render', payload: { tree: { component: 'Field',
+      props: Object.assign({ name, label, input, value }, {}), children: [] },
+      kind: 'form', fragment_id: fid2 } }));
+  const frameInput = () => ev("document.querySelector('#r input').value", fctx);
+  await fieldRender('age', 'Age', 'number', 1, 'gate-num');
+  await lastStatus();
+  await ev("(()=>{let i=document.querySelector('#r input');i.value='42';i.dispatchEvent(new Event('input',{bubbles:true}))})()", fctx);
+  await sleep(300);
+  await fieldRender('age', 'Age', 'number', 1, 'gate-num');
+  await lastStatus();
+  gate('numeric typed value survives re-render', (await frameInput()) === '42');
+  await ev("(()=>{let i=document.querySelector('#r input');i.value='0';i.dispatchEvent(new Event('input',{bubbles:true}))})()", fctx);
+  await sleep(300);
+  await fieldRender('age', 'Age', 'number', 1, 'gate-num');
+  await lastStatus();
+  gate('numeric zero survives re-render', (await frameInput()) === '0');
+  await ev("(()=>{let i=document.querySelector('#r input');i.value='';i.dispatchEvent(new Event('input',{bubbles:true}))})()", fctx);
+  await sleep(300);
+  await fieldRender('age', 'Age', 'number', 1, 'gate-num');
+  await lastStatus();
+  gate('numeric cleared input stays empty (no stale revert)', (await frameInput()) === '');
+  await fieldRender('nick', 'Nick', 'text', 'x', 'gate-text');
+  await lastStatus();
+  await ev("(()=>{let i=document.querySelector('#r input');i.value='hello';i.dispatchEvent(new Event('input',{bubbles:true}))})()", fctx);
+  await sleep(300);
+  await fieldRender('nick', 'Nick', 'text', 'x', 'gate-text');
+  await lastStatus();
+  gate('text typed value survives re-render', (await frameInput()) === 'hello');
+  await fieldRender('flag', 'Flag', 'boolean', false, 'gate-bool');
+  await lastStatus();
+  await ev("document.querySelector('#r input').click()", fctx);
+  await sleep(300);
+  await fieldRender('flag', 'Flag', 'boolean', false, 'gate-bool');
+  await lastStatus();
+  gate('boolean toggled checkbox survives re-render',
+    (await ev("document.querySelector('#r input').checked", fctx)) === true);
+
   // --- containment: own-frame navigation attempt must not escape the frame ---
   const bubblesBefore = await ev("document.getElementById('bubbles').innerHTML.length");
   const buttonsBefore = await ev("document.querySelectorAll('button').length");
@@ -264,12 +415,13 @@ try {
     (await call('Page.getFrameTree')).frameTree.frame.url === topUrlBefore);
 
   console.log(failures.length ? `GATE FAIL ${failures.length}` : 'GATE OK');
-  ws.close();
-  process.exit(failures.length ? 1 : 0);
+  exitCode = failures.length ? 1 : 0;
 } catch (e) {
   console.log('ERROR ' + String(e && e.stack || e).slice(0, 500));
-  try { ws && ws.close(); } catch {}
-  process.exitCode = 1;
-} finally {
-  chrome.kill();
+  exitCode = 1;
 }
+// Guaranteed cleanup on every path (success/error/timeout): the browser this
+// run owns is closed and reaped BEFORE exit, so no gate Chrome ever lingers
+// on the debug port. process.exit runs only after cleanup is awaited.
+await cleanup();
+process.exit(exitCode);

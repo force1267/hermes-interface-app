@@ -70,16 +70,31 @@ class T_BrowserGate(unittest.TestCase):
             f.write(page)
         user_dir = os.path.join(tmpd, "chrome")
         os.makedirs(user_dir, exist_ok=True)
+        # Port "0": the gate asks chrome for an ephemeral debug port owned by
+        # this run only, so parallel/repeated runs never share a stale
+        # browser. The gate runs in its own process group so a timeout kills
+        # the whole tree (node + its chrome child), never orphaning a gate
+        # Chrome on a reused port.
+        import signal as _signal
+        proc = subprocess.Popen(
+            [NODE, MJS, page_path, CHROME, user_dir, "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
         try:
-            r = subprocess.run(
-                [NODE, MJS, page_path, CHROME, user_dir, "19341"],
-                capture_output=True, text=True, timeout=240)
-        finally:
-            pass
-        print(r.stdout)
-        print(r.stderr)
-        self.assertEqual(r.returncode, 0,
-                         f"browser gate failed:\n{r.stdout}\n{r.stderr}")
+            out, err = proc.communicate(timeout=240)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            out, err = proc.communicate()
+            rc = 124
+            out = (out or "") + "\nGATE TIMEOUT after 240s (process group killed)"
+        print(out)
+        print(err)
+        self.assertEqual(rc, 0,
+                         f"browser gate failed:\n{out}\n{err}")
 
 
 if __name__ == "__main__":

@@ -164,7 +164,7 @@ FRAME_JS = r"""
        Object.prototype.hasOwnProperty.call(formValues,name)){
       var v = formValues[name];
       if(props.input==="text"&&typeof v==="string") return v;
-      if(props.input==="number"&&typeof v==="number") return v;
+      if(props.input==="number"&&(typeof v==="number"||v==="")) return v;
       if(props.input==="boolean"&&typeof v==="boolean") return v;
     }
     return props.value;
@@ -202,7 +202,18 @@ FRAME_JS = r"""
     var t = ev.target;
     if(!t||!t.name||!CURRENT) return;
     var vals = FORMS[CURRENT]||(FORMS[CURRENT]={});
-    vals[t.name] = (t.type==="checkbox") ? !!t.checked : t.value;
+    if(t.type==="checkbox"){ vals[t.name] = !!t.checked; }
+    else if(t.type==="number"){
+      // Number inputs expose strings; keep state type-correct (fieldValue
+      // only honours real numbers, so a raw string would be dropped and the
+      // typed value lost on re-render). Empty/cleared input stays "" and is
+      // rendered as an empty box; anything parseable becomes a Number
+      // (zero included); unparseable input clears to "" rather than silently
+      // reverting to the stale prop value.
+      if(t.value===""||t.value===null||t.value===undefined){ vals[t.name] = ""; }
+      else { var n = Number(t.value); vals[t.name] = isNaN(n) ? "" : n; }
+    }
+    else { vals[t.name] = t.value; }
     try{ window.parent.postMessage({op:"form-state", fragment_id:CURRENT, values:vals}, "*"); }catch(e){}
   });
   function reply(status){
@@ -218,6 +229,23 @@ FRAME_JS = r"""
       t = t.parentNode;
     }
   }, true);
+  // Real user clicks on expanded-frame buttons dispatch to the parent: the
+  // frame only forwards (with its channel credentials); the parent validates
+  // source/token/context/registration before running the action op. A plain
+  // debugger-injected parent message never exercises this path.
+  document.addEventListener("click", function(e){
+    var t = e.target;
+    while(t&&t!==document){
+      if(t.tagName==="BUTTON"&&t.hasAttribute&&t.hasAttribute("data-action")){
+        e.preventDefault();
+        try{ window.parent.postMessage({op:"action-click", token:TOKEN,
+          context:CONTEXT, fragment_id:CURRENT,
+          action_id:t.getAttribute("data-action")}, "*"); }catch(err){}
+        return;
+      }
+      t = t.parentNode;
+    }
+  });
   window.__renderTree = function(tree, kind, formValues, preview){
     var cleaned = cleanNode(tree);
     checkKind(cleaned, kind);
@@ -368,6 +396,14 @@ window.P2_BUBBLES = __BUBBLES_JSON__;
     var d = ev.data || {};
     if(d.op === "form-state" && d.fragment_id){
       STORED[d.fragment_id] = d.values || {};
+    } else if(d.op === "action-click"){
+      // Expanded-frame button click: verify channel credentials and that the
+      // action is registered before dispatching. Unregistered ids are dropped
+      // here so the frame never runs an action the parent did not allow.
+      if(d.token !== window.P2_TOKEN || d.context !== window.P2_CONTEXT) return;
+      var aid = d.action_id;
+      if(typeof aid !== "string" || window.P2_ACTIONS.indexOf(aid) < 0) return;
+      post("action", {action_id: aid});
     }
   });
   function findBubble(id){
