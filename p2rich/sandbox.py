@@ -37,7 +37,11 @@ from .renderer import PREVIEW_STYLE
 # Physical preview clamp as a hash-pinned stylesheet rule: the page CSP has
 # no style-src allowance for inline styles (they fall back to default-src
 # 'none'), so the bound lives here, pinned by hash like the scripts.
-PREVIEW_CSS = "article.preview{" + PREVIEW_STYLE + "}"
+# The degraded drawer-entry rule lives here for the same reason: a second
+# <style> block or a style= attribute would not match the pinned style
+# hash and would be blocked.
+PREVIEW_CSS = ("article.preview{" + PREVIEW_STYLE + "}"
+               "#drawer li.degraded{opacity:.55}")
 
 SANDBOX_ATTR = "allow-scripts"
 FRAME_ID = "frag-frame"
@@ -515,50 +519,390 @@ window.P2_BUBBLES = __BUBBLES_JSON__;
       e.preventDefault(); first.focus();
     }
   });
-  /* P3 drawer/i-flow surface: pinned-first entries, Add last. The section
-  is server-rendered above; this wires its real interactions. Destructive
-  and repair ops (and any needs_repair entry) need an explicit second
-  confirming click; nothing is removed on the first click. */
+  /* P3 drawer/i-flow operations: named op boundary mirroring
+  p3drawer/ops.py (add/rename/pin/unpin/delete/repair, same names and
+  same confirm gating). Ops mutate a durable client store seeded from the
+  server render and persisted to localStorage, then re-render; the status
+  line is set only from actual op results, never before success.
+  Destructive and repair ops (and any needs_repair entry) need an explicit
+  second confirming click with a Cancel affordance; cancel preserves the
+  entry. The fragment sandbox is untouched: this layer never posts to the
+  frame and never renders fragment data. */
   (function(){
     var sec = document.getElementById("drawer");
     if(!sec) return;
     var status = document.getElementById("drawer-status");
+    var ul = sec.querySelector("ul");
+    var addBtn = sec.querySelector('[data-drawer-op="add-page"]');
     function say(t){ if(status) status.textContent = t; }
+    var OPS = ["add", "rename", "pin", "unpin", "delete", "repair"];
+    var LS_KEY = "p3-drawer-v1";
+    var failNext = null;
+    function esc(s){ return String(s).replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;"); }
+    function numId(id){ var m = /^pg-([0-9]+)$/.exec(id || "");
+      return m ? parseInt(m[1], 10) : 0; }
+    function seedFromDOM(){
+      var out = [], maxId = 0, maxSeq = 0;
+      var lis = ul.querySelectorAll("li[data-page]");
+      for(var i = 0; i < lis.length; i++){
+        var li = lis[i], id = li.getAttribute("data-page");
+        var seq = parseInt(li.getAttribute("data-seq") || "0", 10) || 0;
+        if(seq > maxSeq) maxSeq = seq;
+        var n = numId(id); if(n > maxId) maxId = n;
+        out.push({id: id, name: li.getAttribute("data-name") || "",
+          pinned: li.getAttribute("data-pinned") === "1",
+          status: li.getAttribute("data-status") || "ok",
+          needs: !!li.querySelector('[data-needs="1"]'), seq: seq});
+      }
+      return {entries: out, maxId: maxId, maxSeq: maxSeq};
+    }
+    function fingerprint(seed){
+      return seed.entries.map(function(e){
+        return [e.id, e.name, e.pinned ? 1 : 0, e.status, e.seq]
+          .join("|");
+      }).join(";");
+    }
+    var seed = seedFromDOM();
+    var seedFp = fingerprint(seed);
+    var S = null;
+    try{
+      var raw = window.localStorage ?
+        window.localStorage.getItem(LS_KEY) : null;
+      if(raw){
+        var parsed = JSON.parse(raw);
+        if(parsed && parsed.seed === seedFp && parsed.entries) S = parsed;
+      }
+    }catch(e){ S = null; }
+    if(!S) S = {seed: seedFp, entries: seed.entries,
+      nextId: seed.maxId + 1, nextSeq: seed.maxSeq + 1};
+    function save(){
+      S.seed = seedFp;
+      try{
+        if(window.localStorage)
+          window.localStorage.setItem(LS_KEY, JSON.stringify(S));
+      }catch(e){}
+    }
+    function byId(id){
+      for(var i = 0; i < S.entries.length; i++)
+        if(S.entries[i].id === id) return S.entries[i];
+      return null;
+    }
+    function uniqueName(base, exceptId){
+      var t = {};
+      S.entries.forEach(function(e){
+        if(e.id !== exceptId) t[e.name] = 1;
+      });
+      if(!t[base]) return base;
+      var n = 2;
+      while(t[base + " " + n]) n++;
+      return base + " " + n;
+    }
+    function sorted(){
+      var p = S.entries.filter(function(e){ return e.pinned; });
+      var u = S.entries.filter(function(e){ return !e.pinned; });
+      u.sort(function(a, b){ return a.seq - b.seq; });
+      return p.concat(u);
+    }
+    function entryButtons(e){
+      var ops = e.needs ? ["repair", "delete"] :
+        [(e.pinned ? "unpin" : "pin"), "rename", "delete"];
+      return ops.map(function(op){
+        var extra = op === "rename" ?
+          ' data-name="' + esc(e.name) + '"' : "";
+        return '<button data-drawer-op="' + op + '" data-page="' +
+          esc(e.id) + '"' + extra + ">" + op + "</button>";
+      }).join("");
+    }
+    function render(){
+      ul.innerHTML = sorted().map(function(e){
+        var cls = e.needs ? ' class="degraded"' : "";
+        var flag = e.needs ?
+          '<span data-needs="1">needs_repair</span>' : "";
+        return "<li" + cls + ' data-page="' + esc(e.id) +
+          '" data-pinned="' + (e.pinned ? "1" : "0") + '" data-status="' +
+          esc(e.status) + '" data-name="' + esc(e.name) + '" data-seq="' +
+          e.seq + '"><span class="dname">' + esc(e.name) + "</span>" +
+          flag + entryButtons(e) + "</li>";
+      }).join("");
+      save();
+    }
+    /* -- op implementations: mutate the durable store, report results -- */
+    function doAdd(name){
+      if(failNext && failNext.op === "add"){
+        var msg = failNext.message || "injected mid-write failure";
+        var pending = name || "Untitled";
+        failNext = null;
+        return {status: "error", message: msg, retry: true,
+          pendingName: pending};
+      }
+      var finalName = uniqueName(name || "Untitled");
+      var id = "pg-" + (S.nextId++);
+      S.entries.push({id: id, name: finalName, pinned: false,
+        status: "ok", needs: false, seq: S.nextSeq++});
+      return {status: "ok", id: id, name: finalName};
+    }
+    function doRename(id, newName){
+      var e = byId(id);
+      if(!e) return {status: "unknown-page", id: id};
+      e.name = uniqueName(newName || e.name, id);
+      return {status: "ok", id: id, name: e.name};
+    }
+    function doPin(id, on){
+      var e = byId(id);
+      if(!e) return {status: "unknown-page", id: id};
+      e.pinned = !!on;
+      return {status: "ok", id: id, pinned: e.pinned};
+    }
+    function doDelete(id){
+      for(var i = 0; i < S.entries.length; i++)
+        if(S.entries[i].id === id){
+          S.entries.splice(i, 1);
+          return {status: "ok", id: id, deleted: true};
+        }
+      return {status: "unknown-page", id: id};
+    }
+    function doRepair(id){
+      var e = byId(id);
+      if(!e) return {status: "unknown-page", id: id};
+      if(!e.needs)
+        return {status: "ok", id: id, repaired: false,
+          reason: "no-repair-needed"};
+      e.needs = false;
+      e.status = "ok";
+      return {status: "ok", id: id, repaired: true};
+    }
+    function dispatch(op){
+      var name = op && op.op;
+      if(OPS.indexOf(name) < 0) return {status: "unknown-op", op: name};
+      if(name === "add") return doAdd(op.name);
+      if(name === "rename") return doRename(op.page_id, op.new_name);
+      if(name === "pin") return doPin(op.page_id, true);
+      if(name === "unpin") return doPin(op.page_id, false);
+      if(name === "delete"){
+        if(!op.confirm) return {status: "confirm-required", id: op.page_id};
+        return doDelete(op.page_id);
+      }
+      if(name === "repair"){
+        if(!op.confirm) return {status: "confirm-required", id: op.page_id};
+        return doRepair(op.page_id);
+      }
+    }
+    /* -- UI flows: forms + two-step confirm/cancel, status from results -- */
     var armed = null;
+    function liFor(id){
+      var lis = ul.querySelectorAll("li[data-page]");
+      for(var i = 0; i < lis.length; i++)
+        if(lis[i].getAttribute("data-page") === id) return lis[i];
+      return null;
+    }
+    function hideAddForm(){
+      var f = document.getElementById("drawer-add-form");
+      if(f && f.parentNode) f.parentNode.removeChild(f);
+    }
+    function showAddForm(){
+      hideAddForm();
+      armed = null;
+      render();
+      var box = document.createElement("div");
+      box.id = "drawer-add-form";
+      box.innerHTML = "<label>Add page " +
+        '<input id="drawer-add-name" type="text"></label> ' +
+        '<button data-drawer-ui="add-confirm">Add</button> ' +
+        '<button data-drawer-ui="add-cancel">Cancel</button>';
+      addBtn.parentNode.insertBefore(box, addBtn);
+      var inp = box.querySelector("input");
+      if(inp) inp.focus();
+      say("Add a page: name it, then confirm.");
+    }
+    function confirmAdd(retryName){
+      var inp = document.getElementById("drawer-add-name");
+      var name = (retryName !== undefined) ? retryName :
+        (inp && inp.value ? inp.value : "Untitled");
+      var r = dispatch({op: "add", name: name});
+      if(r.status === "error"){
+        var box = document.getElementById("drawer-add-form");
+        if(box){
+          var err = box.querySelector(".drawer-add-error");
+          if(!err){
+            err = document.createElement("div");
+            err.className = "drawer-add-error";
+            box.appendChild(err);
+          }
+          err.innerHTML = "<span></span> " +
+            '<button data-drawer-ui="add-retry">Retry</button>';
+          err.querySelector("span").textContent =
+            "Couldn\u2019t add that page (" + r.message +
+            "). Nothing was added.";
+          box.setAttribute("data-pending-name", r.pendingName);
+        }
+        say("Couldn\u2019t add that page (" + r.message +
+          "). Nothing was added. Fix and retry.");
+        return;
+      }
+      hideAddForm();
+      render();
+      say('Added page "' + r.name + '" as ' + r.id + ".");
+    }
+    function showRenameForm(id){
+      var e = byId(id);
+      if(!e) return;
+      armed = null;
+      hideAddForm();
+      render();
+      var li = liFor(id);
+      if(!li) return;
+      li.innerHTML = "<span></span> " +
+        '<input id="drawer-rename-name" type="text"> ' +
+        '<button data-drawer-ui="rename-save">Save</button> ' +
+        '<button data-drawer-ui="rename-cancel">Cancel</button>';
+      li.querySelector("span").textContent = e.name;
+      var inp = li.querySelector("input");
+      inp.value = e.name;
+      inp.setAttribute("data-page", id);
+      inp.focus();
+      say("Rename " + id + ': edit the name, then save.');
+    }
+    function showConfirm(op, id){
+      armed = op + ":" + id;
+      render();
+      var li = liFor(id);
+      if(li){
+        var bar = document.createElement("span");
+        bar.innerHTML = '<button data-drawer-ui="confirm">Confirm ' + op +
+          "</button> " + '<button data-drawer-ui="cancel">Cancel</button>';
+        bar.querySelector('[data-drawer-ui="confirm"]')
+          .setAttribute("data-op", op);
+        bar.querySelector('[data-drawer-ui="confirm"]')
+          .setAttribute("data-page", id);
+        bar.querySelector('[data-drawer-ui="cancel"]')
+          .setAttribute("data-page", id);
+        li.appendChild(bar);
+      }
+      var e = byId(id);
+      say("Confirm " + op + " for " + id +
+        (e && e.needs ? " (needs_repair)." : ".") +
+        " Click again to confirm, or cancel.");
+    }
+    function runConfirmed(op, id){
+      var r = dispatch({op: op, page_id: id, confirm: true});
+      armed = null;
+      render();
+      if(r.status === "ok" && (r.deleted || r.repaired))
+        say((op === "delete" ? "Deleted " : "Repaired ") + id + ".");
+      else if(r.status === "ok")
+        say("Done: " + op + " " + id + ".");
+      else
+        say("Couldn\u2019t " + op + " " + id + " (" + r.status +
+          "). Nothing changed.");
+    }
+    function handleDrawerClick(t){
+      var op = t.getAttribute("data-drawer-op");
+      var page = t.getAttribute("data-page") || "";
+      if(op === "add-page"){ showAddForm(); return; }
+      if(op === "pin" || op === "unpin"){
+        var r = dispatch({op: op, page_id: page});
+        armed = null;
+        hideAddForm();
+        render();
+        if(r.status === "ok")
+          say((op === "pin" ? "Pinned " : "Unpinned ") + page + ".");
+        else say("Couldn\u2019t " + op + " " + page + " (" + r.status +
+          "). Nothing changed.");
+        return;
+      }
+      if(op === "rename"){ showRenameForm(page); return; }
+      if(op === "delete" || op === "repair"){
+        if(armed === op + ":" + page) runConfirmed(op, page);
+        else showConfirm(op, page);
+        return;
+      }
+    }
+    function handleUiClick(t){
+      var ui = t.getAttribute("data-drawer-ui");
+      if(ui === "add-confirm"){ confirmAdd(); return; }
+      if(ui === "add-retry"){
+        var box = document.getElementById("drawer-add-form");
+        confirmAdd(box ? box.getAttribute("data-pending-name") : "Untitled");
+        return;
+      }
+      if(ui === "add-cancel"){
+        hideAddForm();
+        say("Add cancelled; nothing was added.");
+        return;
+      }
+      if(ui === "rename-save"){
+        var li = t.parentNode;
+        var inp = li && li.querySelector("input");
+        var id = inp ? inp.getAttribute("data-page") : "";
+        var r = dispatch({op: "rename", page_id: id,
+          new_name: inp ? inp.value : ""});
+        render();
+        if(r.status === "ok")
+          say('Renamed ' + id + ' to "' + r.name + '".');
+        else say("Couldn\u2019t rename " + id + " (" + r.status +
+          "). Nothing changed.");
+        return;
+      }
+      if(ui === "rename-cancel"){
+        render();
+        say("Rename cancelled; name kept.");
+        return;
+      }
+      if(ui === "confirm"){
+        runConfirmed(t.getAttribute("data-op"),
+          t.getAttribute("data-page"));
+        return;
+      }
+      if(ui === "cancel"){
+        var kept = t.getAttribute("data-page");
+        armed = null;
+        render();
+        say("Cancelled; " + (kept || "entry") + " kept.");
+        return;
+      }
+    }
     sec.addEventListener("click", function(e){
       var t = e.target;
       while(t && t !== sec){
         if(t.getAttribute && t.getAttribute("data-drawer-op")){
-          var op = t.getAttribute("data-drawer-op");
-          var page = t.getAttribute("data-page") || "";
-          if(op === "add-page"){ say("Add a page: name it, then confirm."); return; }
-          if(op === "pin"){ say("Pinned " + page + "."); return; }
-          if(op === "unpin"){ say("Unpinned " + page + "."); return; }
-          if(op === "rename"){
-            say("Rename " + page + " to '" +
-              (t.getAttribute("data-name") || "") + "'.");
-            return;
-          }
-          if(op === "delete" || op === "repair"){
-            var key = op + ":" + page;
-            var orphan = t.parentNode &&
-              t.parentNode.querySelector('[data-needs="1"]');
-            if(armed === key){
-              say((op === "delete" ? "Deleted " : "Repaired ") + page + ".");
-              armed = null;
-            } else {
-              armed = key;
-              say("Confirm " + op + " for " + page +
-                (orphan ? " (needs_repair)." : ".") +
-                " Click again to confirm.");
-            }
-            return;
-          }
+          handleDrawerClick(t);
+          return;
+        }
+        if(t.getAttribute && t.getAttribute("data-drawer-ui")){
+          handleUiClick(t);
           return;
         }
         t = t.parentNode;
       }
     });
+    /* Test + harness surface: same op names as p3drawer/ops.py. */
+    window.DrawerOps = {
+      OPS: OPS,
+      dispatch: dispatch,
+      injectFailure: function(opName, message){
+        failNext = {op: opName || "add",
+          message: message || "injected mid-write failure"};
+      },
+      state: function(){
+        return JSON.parse(JSON.stringify({entries: S.entries,
+          nextId: S.nextId}));
+      },
+      resetForTest: function(){
+        try{
+          if(window.localStorage) window.localStorage.removeItem(LS_KEY);
+        }catch(e){}
+        S = {seed: seedFp, entries: seed.entries,
+          nextId: seed.maxId + 1, nextSeq: seed.maxSeq + 1};
+        armed = null;
+        failNext = null;
+        hideAddForm();
+        render();
+      }
+    };
+    /* Re-render from the durable store so a reload restores prior ops. */
+    render();
   })();
 })();
 """
@@ -580,20 +924,27 @@ def _drawer_section(drawer):
             disp = _html.escape(str(e.get("name", "")))
             status = _html.escape(str(e.get("status", "ok")), quote=True)
             pinned = "1" if e.get("pinned") else "0"
+            try:
+                seq = int(e.get("seq", 0) or 0)
+            except (TypeError, ValueError):
+                seq = 0
             if e.get("needs_repair"):
                 ops = ("repair", "delete")
                 flag = '<span data-needs="1">needs_repair</span>'
+                cls = ' class="degraded"'
             else:
-                ops = ("unpin" if e.get("pinned") else "pin",
+                ops = (("unpin" if e.get("pinned") else "pin"),
                        "rename", "delete")
                 flag = ""
+                cls = ""
             btns = "".join(
                 f'<button data-drawer-op="{op}" data-page="{pid}"'
                 + (f' data-name="{name}"' if op == "rename" else "")
                 + f">{op}</button>" for op in ops)
             items.append(
-                f'<li data-page="{pid}" data-pinned="{pinned}"'
-                f' data-status="{status}" data-name="{name}">'
+                f'<li{cls} data-page="{pid}" data-pinned="{pinned}"'
+                f' data-status="{status}" data-name="{name}"'
+                f' data-seq="{seq}">'
                 f'<span class="dname">{disp}</span>{flag}{btns}</li>')
     return (
         '<section id="drawer" data-drawer="1"><h2>Pages</h2><ul>'

@@ -39,7 +39,31 @@ def ensure_tables(conn):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS page_source("
         " page_id TEXT PRIMARY KEY, fragment TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS drawer_id_seq(next_id INTEGER NOT NULL)")
+    if conn.execute("SELECT next_id FROM drawer_id_seq").fetchone() is None:
+        conn.execute("INSERT INTO drawer_id_seq(next_id) VALUES(?)",
+                     (_max_surviving_id(conn) + 1,))
     conn.commit()
+
+
+def _max_surviving_id(conn):
+    """Highest numeric pg-N id among surviving rows (never decremented)."""
+    best = 0
+    for table, col in (("drawer", "page_id"),
+                       ("page_source", "page_id")):
+        try:
+            rows = conn.execute(
+                f"SELECT {col} FROM {table}").fetchall()
+        except sqlite3.Error:
+            continue
+        for (pid,) in rows:
+            if isinstance(pid, str) and pid.startswith("pg-"):
+                try:
+                    best = max(best, int(pid[3:]))
+                except ValueError:
+                    continue
+    return best
 
 
 def _ver_str(version):
@@ -63,22 +87,42 @@ class Drawer:
         row = self.conn.execute("SELECT MAX(created_seq) FROM drawer_meta").fetchone()
         return (row[0] or 0) + 1
 
+    def _alloc_page_id_tx(self):
+        """Allocate the next id inside the caller's write transaction.
+
+        The high-water mark lives in drawer_id_seq and is bumped in the
+        same transaction as the page rows, so a published id is never
+        recycled: deletes never decrement it, restarts re-read it, and a
+        racing parallel instance either blocks on the write lock or takes
+        the next value. Initialized above surviving maxima so pre-seq DBs
+        keep their existing ids.
+        """
+        row = self.conn.execute(
+            "SELECT next_id FROM drawer_id_seq").fetchone()
+        nxt = row[0] if row is not None else _max_surviving_id(self.conn) + 1
+        floor = _max_surviving_id(self.conn) + 1
+        if nxt < floor:
+            # Rows landed via a path that bypassed the seq (older client):
+            # jump forward, never backward.
+            nxt = floor
+        self.conn.execute("UPDATE drawer_id_seq SET next_id=?", (nxt + 1,))
+        if row is None:
+            self.conn.execute("INSERT INTO drawer_id_seq(next_id) VALUES(?)",
+                              (nxt + 1,))
+        return f"pg-{nxt}"
+
     def _alloc_page_id(self):
-        """Collision-safe id from committed state (restart/instance safe)."""
-        best = 0
-        for table, col in (("drawer", "page_id"),
-                           ("page_source", "page_id")):
-            try:
-                rows = self.conn.execute(
-                    f"SELECT {col} FROM {table}").fetchall()
-            except sqlite3.Error:
-                continue
-            for (pid,) in rows:
-                if isinstance(pid, str) and pid.startswith("pg-"):
-                    try:
-                        best = max(best, int(pid[3:]))
-                    except ValueError:
-                        continue
+        """Collision-safe id from committed state (restart/instance safe).
+
+        Read-only peek for callers outside a creation transaction; the
+        creation path itself allocates via _alloc_page_id_tx so the
+        high-water mark moves atomically with the inserted rows.
+        """
+        row = self.conn.execute(
+            "SELECT next_id FROM drawer_id_seq").fetchone()
+        if row is not None:
+            return f"pg-{max(row[0], _max_surviving_id(self.conn) + 1)}"
+        best = _max_surviving_id(self.conn)
         return f"pg-{best + 1}"
 
     def _names(self):
@@ -164,14 +208,19 @@ class Drawer:
         except (FragmentError, KeyError, TypeError, AttributeError) as e:
             return _chat_retry(
                 f"Couldn't add that page ({e}). Nothing was added.")
-        final_name = self._unique_name(name or "Untitled")
+        base_name = name or "Untitled"
         attempts = 0
         while True:
             attempts += 1
-            page_id = self._alloc_page_id()
-            frag = dict(probe, fragment_id=page_id)
+            # Recomputed per attempt so a retry sees committed state.
+            final_name = self._unique_name(base_name)
             try:
                 with self.conn:
+                    # Allocate inside the write transaction so the
+                    # high-water mark and the page rows commit atomically:
+                    # a mid-write failure rolls both back together.
+                    page_id = self._alloc_page_id_tx()
+                    frag = dict(probe, fragment_id=page_id)
                     self.conn.execute(
                         "INSERT INTO drawer(page_id,fragment_id,status) VALUES(?,?,?)",
                         (page_id, frag["fragment_id"], "ok"))
@@ -206,7 +255,7 @@ class Drawer:
             " LEFT JOIN drawer_meta m ON m.page_id=d.page_id"
             " ORDER BY m.created_seq").fetchall()
         entries = [{"page_id": r[0], "fragment_id": r[1], "status": r[2],
-                    "name": r[3], "pinned": bool(r[4]),
+                    "name": r[3], "pinned": bool(r[4]), "seq": r[5] or 0,
                     "needs_repair": r[2] == "needs_repair",
                     "actions": (["repair", "delete"] if r[2] == "needs_repair"
                                 else ["pin" if not r[4] else "unpin",

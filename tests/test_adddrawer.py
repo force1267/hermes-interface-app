@@ -356,5 +356,129 @@ class T_DrawerShell(unittest.TestCase):
         self.assertIn("rename", html)
 
 
+class T_IdDurability(unittest.TestCase):
+    """Published ids are never recycled (stale refs must not alias)."""
+
+    def test_deleted_id_not_reused_after_restart(self):
+        import tempfile, os
+        path = os.path.join(tempfile.mkdtemp(prefix="p3-ids-"), "d.sqlite")
+        c = sqlite3.connect(path)
+        d = Drawer(c)
+        first = d.create_page("first", text_tree("a"))["drawer_entry"]
+        c.close()
+        c = sqlite3.connect(path)
+        d = Drawer(c)
+        second = d.create_page("second", text_tree("b"))["drawer_entry"]
+        self.assertEqual((first, second), ("pg-1", "pg-2"))
+        self.assertEqual(d.delete(second, confirm=True)["deleted"], True)
+        third = d.create_page("third", text_tree("c"))["drawer_entry"]
+        self.assertNotEqual(third, second)
+        self.assertEqual(third, "pg-3")
+        c.close()
+        c = sqlite3.connect(path)
+        d = Drawer(c)
+        fourth = d.create_page("fourth", text_tree("d"))["drawer_entry"]
+        self.assertEqual(fourth, "pg-4")
+        c.close()
+
+    def test_parallel_instances_never_collide_or_reuse(self):
+        import tempfile, os, threading
+        path = os.path.join(tempfile.mkdtemp(prefix="p3-par-"), "d.sqlite")
+        c = sqlite3.connect(path, timeout=30)
+        Drawer(c).create_page("seed", text_tree("s"))
+        c.close()
+        made, errors = [], []
+        def worker(n):
+            try:
+                cc = sqlite3.connect(path, timeout=30)
+                dd = Drawer(cc)
+                r = dd.create_page(f"W{n}", text_tree(f"w{n}"))
+                made.append(r["drawer_entry"])
+                cc.close()
+            except Exception as e:  # pragma: no cover - must not happen
+                errors.append(repr(e))
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(made)), 8)
+        c = sqlite3.connect(path)
+        ids = sorted(r[0] for r in
+                     c.execute("SELECT page_id FROM drawer"))
+        self.assertEqual(len(ids), 9)
+        nxt = Drawer(c).create_page("after", text_tree("z"))["drawer_entry"]
+        self.assertNotIn(nxt, ids)
+        c.close()
+
+    def test_mid_write_failure_keeps_high_water_mark(self):
+        c, d = memdrawer()
+        d.create_page("a", text_tree("a"))
+        c.execute("CREATE TRIGGER fail_meta BEFORE INSERT ON drawer_meta"
+                  " BEGIN SELECT RAISE(ABORT, 'injected mid-write failure'); END")
+        r = d.create_page("failure", text_tree("x"))
+        self.assertEqual(r["status"], "chat-text-retry")
+        c.execute("DROP TRIGGER fail_meta")
+        ok = d.create_page("after", text_tree("y"))
+        self.assertEqual(ok["status"], "ok")
+        self.assertEqual(ok["drawer_entry"], "pg-2")
+
+
+class T_OpBoundary(unittest.TestCase):
+    """handle_op routes every shell action and reports real outcomes."""
+
+    def test_all_named_ops_route(self):
+        from p3drawer import handle_op, DRAWER_OPS
+        self.assertEqual(set(DRAWER_OPS),
+                         {"add", "rename", "pin", "unpin", "delete",
+                          "repair", "repair_offer", "resolve", "list"})
+        c, d = memdrawer()
+        r = handle_op(d, {"op": "add", "name": "N", "tree": text_tree("x")})
+        self.assertEqual(r["status"], "ok")
+        pid = r["drawer_entry"]
+        self.assertEqual(handle_op(d, {"op": "pin", "page_id": pid})["pinned"],
+                         True)
+        self.assertEqual(handle_op(d, {"op": "unpin", "page_id": pid})["pinned"],
+                         False)
+        self.assertEqual(handle_op(d, {"op": "rename", "page_id": pid,
+                                       "new_name": "M"})["name"], "M")
+        self.assertEqual(handle_op(d, {"op": "list"})["add"],
+                         {"affordance": "add-page"})
+        self.assertEqual(handle_op(d, {"op": "resolve",
+                                       "page_id": pid})["status"], "ok")
+        kept = handle_op(d, {"op": "delete", "page_id": pid})
+        self.assertEqual(kept["status"], "confirm-required")
+        d._get(pid)  # still there without confirm
+        done = handle_op(d, {"op": "delete", "page_id": pid,
+                             "confirm": True})
+        self.assertTrue(done["deleted"])
+
+    def test_unknown_op_raises_no_success_claim(self):
+        from p3drawer import handle_op
+        from p3drawer.drawer import DrawerError
+        c, d = memdrawer()
+        with self.assertRaises(DrawerError):
+            handle_op(d, {"op": "launch-missiles"})
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM drawer")
+                         .fetchone()[0], 0)
+
+    def test_add_failure_through_boundary_leaves_no_orphan(self):
+        from p3drawer import handle_op
+        c, d = memdrawer()
+        c.execute("CREATE TRIGGER fail_meta BEFORE INSERT ON drawer_meta"
+                  " BEGIN SELECT RAISE(ABORT, 'injected mid-write failure'); END")
+        r = handle_op(d, {"op": "add", "name": "failure",
+                          "tree": text_tree("x")})
+        self.assertEqual(r["status"], "chat-text-retry")
+        self.assertTrue(r["retry"])
+        self.assertIsNone(r["drawer_entry"])
+        for t in ("drawer", "drawer_meta", "page_source"):
+            self.assertEqual(
+                c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0], 0,
+                msg=t)
+
+
 if __name__ == "__main__":
     unittest.main()
