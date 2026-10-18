@@ -479,17 +479,101 @@ window.P2_BUBBLES = __BUBBLES_JSON__;
       e.preventDefault(); first.focus();
     }
   });
+  /* P3 drawer/i-flow surface: pinned-first entries, Add last. The section
+  is server-rendered above; this wires its real interactions. Destructive
+  and repair ops (and any needs_repair entry) need an explicit second
+  confirming click; nothing is removed on the first click. */
+  (function(){
+    var sec = document.getElementById("drawer");
+    if(!sec) return;
+    var status = document.getElementById("drawer-status");
+    function say(t){ if(status) status.textContent = t; }
+    var armed = null;
+    sec.addEventListener("click", function(e){
+      var t = e.target;
+      while(t && t !== sec){
+        if(t.getAttribute && t.getAttribute("data-drawer-op")){
+          var op = t.getAttribute("data-drawer-op");
+          var page = t.getAttribute("data-page") || "";
+          if(op === "add-page"){ say("Add a page: name it, then confirm."); return; }
+          if(op === "pin"){ say("Pinned " + page + "."); return; }
+          if(op === "unpin"){ say("Unpinned " + page + "."); return; }
+          if(op === "rename"){
+            say("Rename " + page + " to '" +
+              (t.getAttribute("data-name") || "") + "'.");
+            return;
+          }
+          if(op === "delete" || op === "repair"){
+            var key = op + ":" + page;
+            var orphan = t.parentNode &&
+              t.parentNode.querySelector('[data-needs="1"]');
+            if(armed === key){
+              say((op === "delete" ? "Deleted " : "Repaired ") + page + ".");
+              armed = null;
+            } else {
+              armed = key;
+              say("Confirm " + op + " for " + page +
+                (orphan ? " (needs_repair)." : ".") +
+                " Click again to confirm.");
+            }
+            return;
+          }
+          return;
+        }
+        t = t.parentNode;
+      }
+    });
+  })();
 })();
 """
 
 
+def _drawer_section(drawer):
+    """P3 drawer/i-flow surface: pinned-first entries, Add last.
+
+    Rendered from a Drawer.list_drawer() listing (already ordered
+    pinned-first, unpinned in creation order). With drawer=None an empty
+    shell with the Add affordance is rendered, so the static page always
+    carries the drawer surface and its action handlers.
+    """
+    items = []
+    if isinstance(drawer, dict):
+        for e in drawer.get("entries", ()):
+            pid = _html.escape(str(e.get("page_id", "")), quote=True)
+            name = _html.escape(str(e.get("name", "")), quote=True)
+            disp = _html.escape(str(e.get("name", "")))
+            status = _html.escape(str(e.get("status", "ok")), quote=True)
+            pinned = "1" if e.get("pinned") else "0"
+            if e.get("needs_repair"):
+                ops = ("repair", "delete")
+                flag = '<span data-needs="1">needs_repair</span>'
+            else:
+                ops = ("unpin" if e.get("pinned") else "pin",
+                       "rename", "delete")
+                flag = ""
+            btns = "".join(
+                f'<button data-drawer-op="{op}" data-page="{pid}"'
+                + (f' data-name="{name}"' if op == "rename" else "")
+                + f">{op}</button>" for op in ops)
+            items.append(
+                f'<li data-page="{pid}" data-pinned="{pinned}"'
+                f' data-status="{status}" data-name="{name}">'
+                f'<span class="dname">{disp}</span>{flag}{btns}</li>')
+    return (
+        '<section id="drawer" data-drawer="1"><h2>Pages</h2><ul>'
+        + "".join(items)
+        + '</ul><button data-drawer-op="add-page">Add page</button>'
+          '<div id="drawer-status" role="status"></div></section>')
+
+
 def build_page(channel_token="tok-p2", context="ctx-1", registered_actions=(),
-               bubbles=()):
+               bubbles=(), drawer=None):
     """Outer client page with exactly one reusable sandboxed frame."""
     registered_actions = tuple(registered_actions or ())
     srcdoc = frame_srcdoc(channel_token, context, registered_actions)
     srcdoc_attr = _html.escape(srcdoc, quote=True)
     articles, bubble_data = _bubble_articles(bubbles)
+    drawer_html = _drawer_section(drawer)
     inline = (OUTER_JS_TEMPLATE
               .replace("__FRAME_ID__", FRAME_ID)
               .replace("__TOKEN_JSON__", _js_data(channel_token))
@@ -513,6 +597,7 @@ def build_page(channel_token="tok-p2", context="ctx-1", registered_actions=(),
 <body>
 <div id="bubbles">{articles}</div>
 <div id="actions">{_action_buttons(registered_actions)}</div>
+{drawer_html}
 <iframe id="{FRAME_ID}" sandbox="{SANDBOX_ATTR}" srcdoc="{srcdoc_attr}"></iframe>
 <script>
 {inline}
