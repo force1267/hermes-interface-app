@@ -167,11 +167,22 @@ def record_snapshot(conn, snapshot_id, api_id, from_ts, to_ts, event_ids):
     conn.commit()
 
 
-def read_signals(conn, api_id, from_ts, to_ts, pattern_id=None):
-    """P03 caller-selected half-open window [from,to)."""
+def read_signals(conn, api_id, from_ts, to_ts, pattern_id=None, fragment_id=None):
+    """P03 caller-selected half-open window [from,to).
+
+    pattern_id narrows live events to one pattern (pattern totals).
+    fragment_id narrows live events to one fragment (fragment attribution:
+    only events carrying that fragment_id count). Rolled aggregates are
+    window-level and unattributable to a single fragment, so under a
+    fragment filter they stay out of the counts while any overlapping
+    aggregate or gap still marks provenance incomplete.
+    """
     q = ("SELECT event_id, event, details FROM events WHERE api_id=? "
-         "AND at>=? AND at<?" + (" AND pattern_id=?" if pattern_id else ""))
+         "AND at>=? AND at<?" + (" AND pattern_id=?" if pattern_id else "")
+         + (" AND fragment_id=?" if fragment_id is not None else ""))
     args = [api_id, from_ts, to_ts] + ([pattern_id] if pattern_id else [])
+    if fragment_id is not None:
+        args.append(fragment_id)
     rows = conn.execute(q, args).fetchall()
     usage = 0
     hits = misses = render_failures = user_flags = 0
@@ -201,11 +212,18 @@ def read_signals(conn, api_id, from_ts, to_ts, pattern_id=None):
             queue_state = d
         elif event == "compatibility":
             compat.append(d)
-    # rolled-up aggregates overlapping the window count too (R02)
-    for r in conn.execute(
+    # rolled-up aggregates overlapping the window count too (R02), except
+    # under a fragment filter: window rollups are not attributable to one
+    # fragment, so they stay out of the counts (their ids stay visible in
+    # provenance) while still marking the fragment read incomplete.
+    agg_rows = conn.execute(
             "SELECT usage_count,hits,misses,render_failures,user_flags,agg_id FROM aggregates "
             "WHERE api_id=? AND NOT (to_ts<=? OR from_ts>=?)",
-            (api_id, from_ts, to_ts)).fetchall():
+            (api_id, from_ts, to_ts)).fetchall()
+    for r in agg_rows:
+        if fragment_id is not None:
+            ids.append(r[5])
+            continue
         usage += r[0]
         hits += r[1]
         misses += r[2]
@@ -216,6 +234,9 @@ def read_signals(conn, api_id, from_ts, to_ts, pattern_id=None):
         "SELECT gap_id FROM gaps WHERE api_id=? AND NOT (to_ts<=? OR from_ts>=?)",
         (api_id, from_ts, to_ts)).fetchall()
     eligible = hits + misses
+    complete = not gaps
+    if fragment_id is not None and agg_rows:
+        complete = False
     return {
         "snapshot_id": f"snap:{api_id}:{from_ts}:{to_ts}",
         "from": from_ts, "to": to_ts, "usage_count": usage,
@@ -224,7 +245,7 @@ def read_signals(conn, api_id, from_ts, to_ts, pattern_id=None):
         "render_failures": render_failures, "user_flags": user_flags,
         "store_bytes": store_bytes, "queue_state": queue_state,
         "compatibility": compat,
-        "provenance": {"event_ids": ids, "complete": not gaps},
+        "provenance": {"event_ids": ids, "complete": complete},
     }
 
 

@@ -93,6 +93,36 @@ def policy(**over):
     return p
 
 
+def shared_seed(c):
+    c.execute("INSERT INTO cache(fragment_id,version,hash,revision,status) VALUES(?,?,?,?,?)",
+              ("flagged", json.dumps("v1"), "hash", "rev1", "cached"))
+    c.execute("INSERT INTO cache(fragment_id,version,hash,revision,status) VALUES(?,?,?,?,?)",
+              ("cold", json.dumps("v1"), "hash", "rev1", "cached"))
+    c.commit()
+    store.add_flow(c, "saved-cold", "cold")
+    evs = [("hot", "usage", {"count": 13}),
+           ("hot", "cache_lookup", {"eligible": True, "outcome": "hit"}),
+           ("flagged", "user_flag", {"reason": "broken"}),
+           ("cold", "usage", {"count": 1}),
+           ("cold", "cache_lookup", {"eligible": True, "outcome": "miss"})]
+    for n, (fid, event, details) in enumerate(evs):
+        store.ingest_event(c, {"event_id": str(n), "at": "2026-01-15",
+                               "api_id": "api1", "pattern_id": "shared",
+                               "fragment_id": fid, "event": event,
+                               "details": details})
+
+
+def shared_policy(**over):
+    p = {"promotion_min_uses": 10, "promotion_max_render_failures": 0,
+         "quarantine_flag_threshold": 1, "quarantine_min_hit_rate": None,
+         "evict_max_uses": 1, "evict_max_hit_rate": 0.2,
+         "allow_orphan": False,
+         "fragments": {f: {"version": "v1", "hash": "hash", "revision": "rev1"}
+                       for f in ("hot", "flagged", "cold")}}
+    p.update(over)
+    return p
+
+
 class T_P4Loop(unittest.TestCase):
     def test_promote_quarantine_evict_unaided(self):
         c = memdb()
@@ -203,6 +233,83 @@ class T_P4Loop(unittest.TestCase):
         self.assertFalse(s["provenance"]["complete"])
         self.assertEqual(c.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
         self.assertEqual(c.execute("SELECT COUNT(*) FROM aggregates").fetchone()[0], 1)
+
+    def test_shared_pattern_keeps_fragment_attribution(self):
+        # One pattern behind three fragments: each fragment sees only its
+        # own live events, never the whole-pattern totals.
+        c = memdb()
+        shared_seed(c)
+        view = status_view(c, api_id="api1", from_ts=FROM, to_ts=TO)
+        by_fid = {s["fragment_id"]: s["signals"] for s in view["signals"]}
+        self.assertEqual((by_fid["hot"]["usage_count"],
+                          by_fid["hot"]["cache_hits"],
+                          by_fid["hot"]["user_flags"]), (13, 1, 0))
+        self.assertEqual((by_fid["flagged"]["usage_count"],
+                          by_fid["flagged"]["user_flags"]), (0, 1))
+        self.assertEqual((by_fid["cold"]["usage_count"],
+                          by_fid["cold"]["cache_misses"],
+                          by_fid["cold"]["user_flags"]), (1, 1, 0))
+        self.assertEqual(by_fid["hot"]["pattern_ids"], ["shared"])
+        self.assertIn("versions", by_fid["hot"])
+        res = run_cycle(c, api_id="api1", agent_id="ag", actor_api="api1",
+                        policy=shared_policy(), from_ts=FROM, to_ts=TO, at=AT)
+        acts = sorted((o["action"], o["fragment_id"], o["status"])
+                      for o in res["outcomes"])
+        self.assertEqual(acts, [("evict", "cold", "applied"),
+                                ("promote_cache", "hot", "applied"),
+                                ("quarantine", "flagged", "applied")])
+        # Innocent cold is evicted, never quarantined on another's flag.
+        self.assertFalse([o for o in res["outcomes"]
+                          if o["action"] == "quarantine"
+                          and o["fragment_id"] == "cold"])
+        self.assertEqual(c.execute("SELECT status FROM cache WHERE fragment_id='hot'").fetchone()[0],
+                         "cached")
+        self.assertEqual(c.execute("SELECT status FROM cache WHERE fragment_id='cold'").fetchone()[0],
+                         "tombstone")
+
+    def test_post_prune_unknown_history_stands_down(self):
+        # After a prune the retained rollup stays visible but unattributed,
+        # and the next loop never treats it as known zero.
+        c = memdb()
+        shared_seed(c)
+        run_cycle(c, api_id="api1", agent_id="ag", actor_api="api1",
+                  policy=shared_policy(), from_ts=FROM, to_ts=TO, at=AT)
+        res = run_cycle(c, api_id="api1", agent_id="ag", actor_api="api1",
+                        policy=shared_policy(prune_from=FROM, prune_to=TO),
+                        from_ts=FROM, to_ts=TO, at=AT)
+        self.assertEqual(res["prune"]["status"], "applied")
+        view = status_view(c, api_id="api1", from_ts=FROM, to_ts=TO)
+        for s in view["signals"]:
+            self.assertEqual(s["signals"]["note"],
+                             "history-rolled-attribution-unknown")
+            self.assertFalse(s["signals"]["complete"])
+            self.assertEqual(s["signals"]["window_usage_count"], 14)
+        self.assertIn("window-rollup attribution-unknown", view["text"])
+        rerun = run_cycle(c, api_id="api1", agent_id="ag", actor_api="api1",
+                          policy=shared_policy(), from_ts=FROM, to_ts=TO, at=AT)
+        self.assertEqual(rerun["outcomes"], [])
+        # Hot keeps serving on retained (rolled) usage, never evicted as zero.
+        self.assertEqual(c.execute("SELECT status FROM cache WHERE fragment_id='hot'").fetchone()[0],
+                         "cached")
+        s = store.read_signals(c, "api1", FROM, TO)
+        self.assertEqual(s["usage_count"], 14)
+        self.assertFalse(s["provenance"]["complete"])
+
+    def test_prune_audit_carries_signals_and_policy(self):
+        c = memdb()
+        shared_seed(c)
+        run_cycle(c, api_id="api1", agent_id="ag", actor_api="api1",
+                  policy=shared_policy(prune_from=FROM, prune_to=TO),
+                  from_ts=FROM, to_ts=TO, at=AT)
+        prune = decision_log(c, "api1")[-1]
+        self.assertEqual(prune["action"], "prune_events")
+        self.assertTrue(prune["reason"])
+        self.assertEqual(prune["parameters"]["signals"]["usage_count"], 14)
+        self.assertEqual((prune["parameters"]["signals"]["cache_hits"],
+                          prune["parameters"]["signals"]["cache_misses"],
+                          prune["parameters"]["signals"]["user_flags"]), (1, 1, 1))
+        self.assertEqual(prune["parameters"]["policy"],
+                         {"prune_from": FROM, "prune_to": TO})
 
 
 if __name__ == "__main__":

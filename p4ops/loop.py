@@ -11,6 +11,14 @@ missing keys disable that lane instead of falling back to a coded constant.
 The values actually used are persisted inside each decision's parameters, so
 the audit trail proves which runtime numbers produced the outcome.
 
+Fragment attribution: each fragment's signals count only live events
+carrying its own fragment_id -- pattern and window totals are never copied
+across fragments. Rolled aggregates are window-level and unattributable,
+so after a prune fragments without live events read as unknown (never as
+known zero): absence-based lanes (evict, hit-rate collapse) stand down,
+while presence-based lanes (promote on live usage, quarantine on live
+flags) still act on real fragment-specific evidence.
+
 One SQLite store only: this module creates no tables of its own and writes
 only through p0contract.store into the tables store.init_db creates.
 """
@@ -73,40 +81,83 @@ def _pattern_fragment_map(conn, api_id, from_ts, to_ts):
     return mapping
 
 
-def _fragment_signals(conn, api_id, from_ts, to_ts):
-    """Per-fragment signals aggregated from per-pattern P0 reads.
-
-    Returns {fragment_id: {pattern_ids, usage_count, eligible_lookups,
-    cache_hits, cache_misses, hit_rate, render_failures, user_flags,
-    complete}} plus a set of cached fragment ids that had no events
-    (zero-activity signals) so disuse-eviction can see them.
-    """
+def _fragment_member_patterns(conn, api_id, from_ts, to_ts):
+    """{fragment_id: sorted [pattern_id]} for window events carrying both."""
     mapping = _pattern_fragment_map(conn, api_id, from_ts, to_ts)
-    per_pattern = {}
-    for pattern_id in mapping:
-        per_pattern[pattern_id] = store.read_signals(
-            conn, api_id, from_ts, to_ts, pattern_id=pattern_id)
+    out = {}
+    for pattern_id, members in mapping.items():
+        for fid in members:
+            out.setdefault(fid, []).append(pattern_id)
+    return {fid: sorted(pats) for fid, pats in out.items()}
+
+
+def _fragment_versions(conn, api_id, from_ts, to_ts, fragment_id):
+    """Distinct fragment_version values behind a fragment's live events.
+
+    None means version-unattributed evidence: it counts toward the
+    cataloged version under decision, and the audit says so openly.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT fragment_version FROM events "
+        "WHERE api_id=? AND at>=? AND at<? AND fragment_id=?",
+        (api_id, from_ts, to_ts, fragment_id)).fetchall()
+    ordered = sorted({r[0] for r in rows}, key=repr)
+    return [None if raw is None else json.loads(raw) for raw in ordered]
+
+
+def _has_rolled_history(conn, api_id, from_ts, to_ts):
+    """True when pruned rollups or gaps overlap the window.
+
+    Rolled counts carry no fragment attribution, so True means fragments
+    without live events read as unknown -- never as known zero -- and
+    absence-based lanes (evict, hit-rate collapse) stand down.
+    """
+    agg = conn.execute(
+        "SELECT agg_id FROM aggregates "
+        "WHERE api_id=? AND NOT (to_ts<=? OR from_ts>=?)",
+        (api_id, from_ts, to_ts)).fetchone()
+    if agg is not None:
+        return True
+    gap = conn.execute(
+        "SELECT gap_id FROM gaps "
+        "WHERE api_id=? AND NOT (to_ts<=? OR from_ts>=?)",
+        (api_id, from_ts, to_ts)).fetchone()
+    return gap is not None
+
+
+def _fragment_signals(conn, api_id, from_ts, to_ts):
+    """Per-fragment signals from fragment-filtered P0 reads.
+
+    Each fragment's counts come only from live events carrying its own
+    fragment_id: whole-pattern and whole-window totals are never copied
+    across fragments, so fragments sharing one pattern keep their own
+    attribution. Rolled aggregates are window-level and unattributable,
+    so the P0 fragment read excludes them from the counts and reports
+    provenance incomplete. ``versions`` names the distinct
+    fragment_version values behind the counts (None = unattributed).
+    """
+    member_patterns = _fragment_member_patterns(conn, api_id, from_ts, to_ts)
+    live = conn.execute(
+        "SELECT DISTINCT fragment_id FROM events "
+        "WHERE api_id=? AND at>=? AND at<? AND fragment_id IS NOT NULL",
+        (api_id, from_ts, to_ts)).fetchall()
     frags = {}
-    for pattern_id, sig in per_pattern.items():
-        for fid in mapping[pattern_id]:
-            acc = frags.setdefault(fid, {
-                "pattern_ids": set(), "usage_count": 0, "eligible_lookups": 0,
-                "cache_hits": 0, "cache_misses": 0, "render_failures": 0,
-                "user_flags": 0, "complete": True,
-                "store_bytes": 0, "queue_state": None})
-            acc["pattern_ids"].add(pattern_id)
-            for k in ("usage_count", "eligible_lookups", "cache_hits",
-                      "cache_misses", "render_failures", "user_flags"):
-                acc[k] += sig[k]
-            acc["complete"] = acc["complete"] and sig["provenance"]["complete"]
-            acc["store_bytes"] = max(acc["store_bytes"], sig["store_bytes"])
-            if sig["queue_state"] is not None:
-                acc["queue_state"] = sig["queue_state"]
-    for fid in frags:
-        elig = frags[fid]["cache_hits"] + frags[fid]["cache_misses"]
-        frags[fid]["eligible_lookups"] = elig
-        frags[fid]["hit_rate"] = (frags[fid]["cache_hits"] / elig) if elig else None
-        frags[fid]["pattern_ids"] = sorted(frags[fid]["pattern_ids"])
+    for (fid,) in live:
+        sig = store.read_signals(
+            conn, api_id, from_ts, to_ts, fragment_id=fid)
+        frags[fid] = {
+            "pattern_ids": member_patterns.get(fid, []),
+            "versions": _fragment_versions(conn, api_id, from_ts, to_ts, fid),
+            "usage_count": sig["usage_count"],
+            "eligible_lookups": sig["eligible_lookups"],
+            "cache_hits": sig["cache_hits"],
+            "cache_misses": sig["cache_misses"],
+            "hit_rate": sig["hit_rate"],
+            "render_failures": sig["render_failures"],
+            "user_flags": sig["user_flags"],
+            "complete": sig["provenance"]["complete"],
+            "store_bytes": sig["store_bytes"],
+            "queue_state": sig["queue_state"]}
     return frags
 
 
@@ -153,6 +204,7 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
     evidence = [snapshot_id]
     auth = {"actor_api": actor_api}
     frags = _fragment_signals(conn, api_id, from_ts, to_ts)
+    rolled = _has_rolled_history(conn, api_id, from_ts, to_ts)
     cache = _cache_rows(conn)
     cached_ids = {fid for (fid, _ver) in cache}
     outcomes = []
@@ -169,13 +221,20 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
         return out
 
     # Lane 1: promote hot ephemeral fragments (Lane A, no MJ approval).
+    # Presence-based: live fragment-specific usage promotes even when older
+    # history was rolled (the evidence is real); unknown history with no
+    # live events is not a promote case.
     for fid in sorted(set(frags) | set(catalog)):
-        sig = frags.get(fid, {"pattern_ids": [], "usage_count": 0,
-                              "eligible_lookups": 0, "cache_hits": 0,
-                              "cache_misses": 0, "hit_rate": None,
-                              "render_failures": 0, "user_flags": 0,
-                              "complete": True, "store_bytes": 0,
-                              "queue_state": None})
+        sig = frags.get(fid)
+        if sig is None:
+            if rolled:
+                continue
+            sig = {"pattern_ids": [], "versions": [], "usage_count": 0,
+                   "eligible_lookups": 0, "cache_hits": 0,
+                   "cache_misses": 0, "hit_rate": None,
+                   "render_failures": 0, "user_flags": 0,
+                   "complete": True, "store_bytes": 0,
+                   "queue_state": None}
         spec = catalog.get(fid)
         if spec is None:
             continue  # agent named no candidate identity: no judgment, no promote
@@ -186,7 +245,8 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
         if (sig["usage_count"] >= policy["promotion_min_uses"]
                 and sig["render_failures"] <= policy["promotion_max_render_failures"]
                 and sig["user_flags"] == 0):
-            promotable = dict(sig, pattern_ids=list(sig["pattern_ids"]))
+            promotable = dict(sig, pattern_ids=list(sig["pattern_ids"]),
+                              versions=list(sig["versions"]))
             reason = ("promote: usage %(u)d >= policy min %(t)d, "
                       "render_failures %(rf)d <= policy max %(m)d, "
                       "user_flags 0, patterns %(p)s" % {
@@ -209,7 +269,9 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
                                        "promotion_max_render_failures":
                                        policy["promotion_max_render_failures"]}}))
 
-    # Lane 2: quarantine on MJ/user flag or hit-rate collapse.
+    # Lane 2: quarantine on MJ/user flag or hit-rate collapse. Flags are
+    # presence-based (a live flag is real fragment-specific evidence);
+    # hit-rate collapse is absence-sensitive, so it needs complete history.
     cache = _cache_rows(conn)  # refresh after promotions
     for fid in sorted(cached_ids & set(frags)):
         sig = frags[fid]
@@ -219,7 +281,8 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
             if row["status"] != "cached":
                 continue
             version = row["version"]
-            collapse = (policy["quarantine_min_hit_rate"] is not None
+            collapse = (sig["complete"]
+                        and policy["quarantine_min_hit_rate"] is not None
                         and sig["hit_rate"] is not None
                         and sig["hit_rate"] < policy["quarantine_min_hit_rate"])
             flagged = sig["user_flags"] >= policy["quarantine_flag_threshold"]
@@ -233,7 +296,8 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
                 why.append("hit_rate %.3f < policy floor %.3f"
                            % (sig["hit_rate"], policy["quarantine_min_hit_rate"]))
             spec = catalog.get(fid, {})
-            params = {"signals": dict(sig, pattern_ids=list(sig["pattern_ids"])),
+            params = {"signals": dict(sig, pattern_ids=list(sig["pattern_ids"]),
+                                      versions=list(sig["versions"])),
                       "policy": {"quarantine_flag_threshold":
                                  policy["quarantine_flag_threshold"],
                                  "quarantine_min_hit_rate":
@@ -250,17 +314,24 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
                 reason="quarantine: %s" % "; ".join(why), parameters=params))
 
     # Lane 3: evict cold cached fragments; R01 declared impacts only.
+    # Disuse is absence-based: it needs complete history. Fragments with
+    # partial history, or none with rolled history behind them, are
+    # unknown -- never known zero -- so the lane stands down.
     cache = _cache_rows(conn)  # refresh after quarantines
     for (fid, verkey), row in sorted(cache.items()):
         if row["status"] != "cached":
             continue
         sig = frags.get(fid)
         if sig is None:
-            sig = {"pattern_ids": [], "usage_count": 0, "eligible_lookups": 0,
+            if rolled:
+                continue
+            sig = {"pattern_ids": [], "versions": [], "usage_count": 0, "eligible_lookups": 0,
                    "cache_hits": 0, "cache_misses": 0, "hit_rate": None,
                    "render_failures": 0, "user_flags": 0, "complete": True,
                    "store_bytes": 0, "queue_state": None,
                    "note": "no-events-in-window"}
+        elif not sig["complete"]:
+            continue
         if sig["user_flags"] != 0:
             continue  # flagged items quarantine, never silently evict
         rate_ok = (policy["evict_max_hit_rate"] is None
@@ -277,7 +348,8 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
         params = {"affected_pins": pins,
                   "allow_orphan": policy["allow_orphan"],
                   "replacement_version": spec.get("replacement_version"),
-                  "signals": dict(sig, pattern_ids=list(sig["pattern_ids"])),
+                  "signals": dict(sig, pattern_ids=list(sig["pattern_ids"]),
+                                  versions=list(sig.get("versions", []))),
                   "policy": {"evict_max_uses": policy["evict_max_uses"],
                              "evict_max_hit_rate": policy["evict_max_hit_rate"]}}
         submit(_decision_base(
@@ -306,6 +378,7 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
             "AND event IN ('user_flag','decision_result')",
             (api_id, frm, to)).fetchall()]
         resolution = {pid: snapshot_id for pid in prot}
+        window_before = store.read_signals(conn, api_id, frm, to)
         decision = {
             "decision_id": "%s:prune" % snapshot_id, "agent_id": agent_id,
             "api_id": api_id, "at": at, "action": "prune_events",
@@ -319,7 +392,18 @@ def run_cycle(conn, *, api_id, agent_id, actor_api, policy,
                           len(prot), snapshot_id)),
             "parameters": {"retained_snapshot_ids": [snapshot_id],
                            "protected_event_ids": prot,
-                           "evidence_resolution": resolution},
+                           "evidence_resolution": resolution,
+                           "signals": {
+                               "usage_count": window_before["usage_count"],
+                               "eligible_lookups":
+                               window_before["eligible_lookups"],
+                               "cache_hits": window_before["cache_hits"],
+                               "cache_misses": window_before["cache_misses"],
+                               "render_failures":
+                               window_before["render_failures"],
+                               "user_flags": window_before["user_flags"],
+                               "provenance": window_before["provenance"]},
+                           "policy": {"prune_from": frm, "prune_to": to}},
             "approval_ref": None}
         out = store.submit_decision(conn, decision, auth, evidence_snapshots=evidence)
         prune = {"decision_id": decision["decision_id"],
@@ -355,19 +439,47 @@ def decision_log(conn, api_id=None):
 
 
 def status_view(conn, *, api_id, from_ts, to_ts):
-    """MJ-readable observability: live signals + the decision audit trail."""
+    """MJ-readable observability: live signals + the decision audit trail.
+
+    Fragments without live events in a window with rolled history show
+    the retained window rollup marked attribution-unknown -- with the
+    incomplete flag -- instead of a bare no-events note, so retained
+    activity never reads as known zero.
+    """
     frags = _fragment_signals(conn, api_id, from_ts, to_ts)
     cache = _cache_rows(conn)
+    rolled = _has_rolled_history(conn, api_id, from_ts, to_ts)
+    window = store.read_signals(conn, api_id, from_ts, to_ts)
+    rollup_unknown = {"note": "history-rolled-attribution-unknown",
+                      "complete": False,
+                      "window_usage_count": window["usage_count"],
+                      "window_cache_hits": window["cache_hits"],
+                      "window_cache_misses": window["cache_misses"],
+                      "window_render_failures": window["render_failures"],
+                      "window_user_flags": window["user_flags"],
+                      "window_complete": window["provenance"]["complete"]}
     signals = []
     for fid in sorted(set(frags) | {f for (f, _v) in cache}):
         sig = frags.get(fid)
         states = ["%s=%s" % (v, r["status"])
                   for (f, v), r in cache.items() if f == fid]
+        if sig is None and rolled:
+            shown = dict(rollup_unknown)
+        else:
+            shown = (dict(sig, pattern_ids=list(sig["pattern_ids"]),
+                          versions=list(sig["versions"]))
+                     if sig else {"note": "no-events-in-window"})
         signals.append({"fragment_id": fid,
-                        "signals": (dict(sig, pattern_ids=list(sig["pattern_ids"]))
-                                    if sig else {"note": "no-events-in-window"}),
+                        "signals": shown,
                         "cache": states or ["not-cached"]})
     lines = ["signals [%s,%s) api=%s" % (from_ts, to_ts, api_id)]
+    if rolled:
+        lines.append("  window-rollup attribution-unknown incomplete "
+                     "usage=%(u)d hits=%(h)d misses=%(m)d flags=%(f)d" % {
+                         "u": window["usage_count"],
+                         "h": window["cache_hits"],
+                         "m": window["cache_misses"],
+                         "f": window["user_flags"]})
     for s in signals:
         lines.append("  %s cache=%s signals=%s"
                      % (s["fragment_id"], ",".join(s["cache"]), s["signals"]))
