@@ -14,6 +14,20 @@ EVENT_ENUM = {"usage", "cache_lookup", "render_result", "user_flag",
 FORBIDDEN_DETAIL_KEYS = {"prompt", "form_values", "credential", "credentials",
                          "media_bytes", "raw_text", "raw_prompt", "upload_bytes"}
 
+# P01/P02: exact allowed details shape per event type. The denylist above
+# stays as a second layer; the allowlist below is the mechanism: unknown
+# keys are rejected so raw content cannot ride in under a novel key name.
+EVENT_DETAIL_SHAPES = {
+    "usage": {"count"},
+    "cache_lookup": {"eligible", "outcome"},
+    "render_result": {"status", "reason"},
+    "user_flag": {"reason"},
+    "compatibility": {"selected_version", "supported_versions"},
+    "queue_state": {"bytes", "items"},
+    "resource_state": {"store_bytes"},
+    "decision_result": {"status", "decision_id", "reason"},
+}
+
 DECISION_ACTIONS = {"promote_cache", "propose_builtin", "quarantine", "restore",
                     "pin_version", "evict", "prune_events", "set_render_budget",
                     "set_queue_policy", "retire_major"}
@@ -74,6 +88,9 @@ def _details_for(event, details):
         raise StoreError("details-must-be-object")
     if set(details.keys()) & FORBIDDEN_DETAIL_KEYS:
         raise StoreError("event-contains-raw-content")
+    allowed = EVENT_DETAIL_SHAPES.get(event)
+    if allowed is not None and (set(details.keys()) - allowed):
+        raise StoreError("event-unknown-detail-key")
     if event == "usage":
         v = details.get("count")
         if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
@@ -340,15 +357,19 @@ def _apply(conn, d, auth):
         if not frag:
             raise StoreError("promote-needs-fragment")
         h = params.get("hash", "h")
+        ver = json.dumps(frag["version"], sort_keys=True)
+        # P04/P06: quarantine + revision guards run BEFORE any write, so a
+        # rejected decision cannot mutate the row or corrupt the revision.
+        cur = conn.execute('SELECT revision, status FROM cache WHERE fragment_id=? AND version=?',
+                         (frag["fragment_id"], ver)).fetchone()
+        if cur and cur[1] == "quarantined":
+            raise StoreError("quarantined")
+        if cur and cur[0] != d["expected_revision"]:
+            raise StoreError("stale-revision")
         conn.execute("INSERT OR REPLACE INTO cache(fragment_id,version,hash,revision,status)"
                      " VALUES(?,?,?,?,?)",
-                     (frag["fragment_id"], json.dumps(frag["version"], sort_keys=True),
+                     (frag["fragment_id"], ver,
                       h, d["expected_revision"], "cached"))
-        # quarantine check (P06): quarantined targets cannot be promoted
-        q = conn.execute("SELECT status FROM cache WHERE fragment_id=? AND version=?",
-                         (frag["fragment_id"], json.dumps(frag["version"], sort_keys=True))).fetchone()
-        if q and q[0] == "quarantined":
-            raise StoreError("quarantined")
         return {"status": "applied", "result": "promoted", "mutated": True}
     if action == "propose_builtin":
         return {"status": "applied", "result": "proposal-recorded", "mutated": True}

@@ -436,6 +436,13 @@ class T_P01(unittest.TestCase):
         self.assertEqual(c.execute("SELECT COUNT(*) FROM drawer").fetchone()[0], 1)
         with self.assertRaises(store.StoreError):
             store.ingest_event(c, ev("e2", "usage", {"count": 1, "prompt": "secret"}))
+        # P01/P02: allowlist is the mechanism — a content-bearing key NOT on
+        # the denylist is still rejected, and nothing is stored.
+        with self.assertRaises(store.StoreError):
+            store.ingest_event(c, ev("e3", "usage", {"count": 2, "text": "raw user message"}))
+        with self.assertRaises(store.StoreError):
+            store.ingest_event(c, ev("e4", "usage", {"count": 2, "note": "freeform"}))
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
 
 
 class T_P02(unittest.TestCase):
@@ -508,6 +515,28 @@ class T_P04(unittest.TestCase):
                      expected_revision="rev-stale", parameters={})
         self.assertIn("stale", store.submit_decision(c, stale, {"actor_api": "api1"},
                                                      evidence_snapshots=["s1"])["result"])
+        # stale expected_revision on promote_cache rejects WITHOUT mutation
+        # and leaves the established revision intact (P04)
+        promo = {"decision_id": "d5", "agent_id": "ag", "api_id": "api1", "at": "2026-07-01",
+                 "action": "promote_cache",
+                 "target": {"type": "fragment", "fragment_id": "f1",
+                            "version": {"major": 1, "minor": 0}},
+                 "expected_revision": "rev1", "registry_revision": "r1",
+                 "signal_snapshot_id": "s1", "reason": "lane-a",
+                 "parameters": {"fragment": {"fragment_id": "f1",
+                                             "version": {"major": 1, "minor": 0}},
+                                "hash": "h"}, "approval_ref": None}
+        self.assertEqual(store.submit_decision(c, promo, {"actor_api": "api1"},
+                                               evidence_snapshots=["s1"])["status"], "applied")
+        before = c.execute("SELECT revision, status FROM cache WHERE fragment_id='f1'").fetchall()
+        stale_promo = dict(promo, decision_id="d6", expected_revision="STALE-NOT-CURRENT")
+        out = store.submit_decision(c, stale_promo, {"actor_api": "api1"},
+                                    evidence_snapshots=["s1"])
+        self.assertEqual(out["status"], "rejected")
+        self.assertIn("stale", out["result"])
+        self.assertFalse(out.get("mutated", True))
+        self.assertEqual(c.execute("SELECT revision, status FROM cache WHERE fragment_id='f1'").fetchall(),
+                         before)
 
 
 class T_P05(unittest.TestCase):
@@ -560,9 +589,24 @@ class T_P06(unittest.TestCase):
                             "prior_hash": "h0"}, "approval_ref": None}
         self.assertIn("quarantined", store.submit_decision(
             c, q, {"actor_api": "api1"}, evidence_snapshots=["s1"])["result"])
-        # quarantined target blocks promotion path (executor rejects unsafe re-promote)
-        with self.assertRaises(store.StoreError):
-            raise store.StoreError("quarantined")
+        # quarantined version blocks promotion: rejected, row untouched (P06)
+        repromote = {"decision_id": "p-quar", "agent_id": "ag", "api_id": "api1", "at": "2026-07-01",
+                     "action": "promote_cache",
+                     "target": {"type": "fragment", "fragment_id": "f1",
+                                "version": {"major": 1, "minor": 1}},
+                     "expected_revision": "rev1", "registry_revision": "r1",
+                     "signal_snapshot_id": "s1", "reason": "recurrence?",
+                     "parameters": {"fragment": {"fragment_id": "f1",
+                                                 "version": {"major": 1, "minor": 1}},
+                                    "hash": "h1"}, "approval_ref": None}
+        out = store.submit_decision(c, repromote, {"actor_api": "api1"},
+                                    evidence_snapshots=["s1"])
+        self.assertEqual(out["status"], "rejected")
+        self.assertIn("quarantined", out["result"])
+        self.assertFalse(out.get("mutated", True))
+        self.assertEqual(c.execute("SELECT status FROM cache WHERE fragment_id='f1' "
+                                   "AND version=?", (json.dumps({"major": 1, "minor": 1}),)).fetchone()[0],
+                         "quarantined")
         r = {"decision_id": "r1", "agent_id": "ag", "api_id": "api1", "at": "2026-07-02",
              "action": "restore",
              "target": {"type": "fragment", "fragment_id": "f1",
