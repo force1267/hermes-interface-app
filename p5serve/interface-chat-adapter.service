@@ -18,6 +18,13 @@ Group=root
 ExecStart=/usr/bin/python3 -m p5serve.serve /etc/interface-app/settings.json
 WorkingDirectory=/opt/interface-app/releases/current
 Environment=PYTHONPATH=/opt/interface-app/releases/current
+# The in-process provider spawns the real Hermes CLI per agent turn. Mark
+# those children supervised (as Hermes-managed processes are): the install
+# carries a pending source-completion tail whose retry needs PyPI, which is
+# unreachable from this box — without the marker every turn burns ~80s in
+# uv retries and exits 1 with no terminal record. With it, the CLI runs on
+# its committed dependencies, exactly like P0/P1 probe runs.
+Environment=HERMES_SUPERVISED_CHILD=1
 Restart=on-failure
 RestartSec=5
 # State lives outside release dirs; survives symlink swaps + reboot.
