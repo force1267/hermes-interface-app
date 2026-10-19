@@ -37,7 +37,7 @@ class Client:
         self._rfile = None
 
     # -- connection --
-    def connect(self, host, port, resume=False):
+    def connect(self, host, port, resume=False, extra=None):
         self._sock = socket.create_connection((host, port), timeout=5)
         self._sock.settimeout(5)
         self._rfile = self._sock.makefile("r", encoding="utf-8")
@@ -48,11 +48,12 @@ class Client:
             env = protocol.mk_resume(
                 self.device_id, self.supported_versions, self.caps,
                 self.registry_revision, self.budget_revision,
-                last_seen=last_seen, cursor=self.cursor)
+                last_seen=last_seen, cursor=self.cursor, extra=extra)
         else:
             env = protocol.mk_hello(
                 self.device_id, self.supported_versions, self.caps,
-                self.registry_revision, self.budget_revision)
+                self.registry_revision, self.budget_revision,
+                extra=extra)
         sess = self._roundtrip(env, expect="session")
         res = messages.validate_message(sess)
         if res["status"] != "ok":

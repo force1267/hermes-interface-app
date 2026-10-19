@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="release-id" content="__RELEASE_ID__">
+<title>chat</title>
+<style>/*__STYLE_CSS__*/</style>
+</head>
+<body>
+<div id="app-shell">
+  <header id="app-header"><span>chat</span><span id="connection-status" role="status">connecting…</span></header>
+  <nav id="drawer"><ul id="drawer-items"><li class="degraded">drawer unavailable</li></ul></nav>
+  <main id="bubbles" aria-live="polite"></main>
+  <section id="add-content" hidden></section>
+  <form id="composer"><input id="composer-input" type="text" autocomplete="off" placeholder="message"><button type="submit" id="composer-send">send</button></form>
+  <div id="frag-host"><iframe id="frag-frame" sandbox="allow-scripts" title="bubble content"></iframe></div>
+</div>
+<noscript><p>chat needs JavaScript for the transport shim. Static shell only.</p></noscript>
+<script>/*__APP_JS__*/</script>
+</body>
+</html>

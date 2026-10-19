@@ -1,0 +1,40 @@
+{
+  "release": "p5-P0",
+  "adapter_generation": 1,
+  "conversation_id": "conv-c-b662c9201fe8ecb7",
+  "prompt": "In exactly one short sentence, use the word quasar-waffle-p5-283a11 to describe a working websocket bridge.",
+  "payload_hash": "2b384b42bcecf097e4a4026bfcc95f0fb2ee53df49bd1bcdca3f83cfc490d55a",
+  "cli": [
+    "/root/.local/bin/hermes",
+    "chat",
+    "--oneshot",
+    "--query-file",
+    "-",
+    "--format",
+    "stream-json",
+    "--no-restore-cwd",
+    "--source",
+    "interface-app"
+  ],
+  "hermes_session_id": "20261019_002607_b4e1b8",
+  "terminal_exit": 0,
+  "terminal_text": "The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops.",
+  "assistant_message_id": "m-r-205efb704d32f6ad-a",
+  "ws_outcome": {
+    "code": "ok",
+    "cursor": "m-r-205efb704d32f6ad-a",
+    "message_id": "m-r-205efb704d32f6ad-a",
+    "status": "completed"
+  },
+  "rendered_bubble": {
+    "frame_payload": null,
+    "id": "m-r-205efb704d32f6ad-a",
+    "major": 1,
+    "preview_html": "<article class=\"bubble gen std preview\" data-fragment=\"f-r-205efb704d32f6ad\" data-kind=\"text\" data-origin=\"generated\" data-mode=\"standard\" data-preview=\"truncated\" style=\"max-height:160px;max-width:360px;overflow:hidden\"><span class=\"gen-badge\">Generated</span><p class=\"t\">The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops.</p><button class=\"x\" data-op=\"expand\">Expand</button></article>",
+    "revision": 1,
+    "role": "assistant",
+    "text": "The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops."
+  },
+  "launch_count": 1,
+  "restart_lookup_without_relaunch": true
+}

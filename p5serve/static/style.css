@@ -1,0 +1,9 @@
+/* Static release-owned chrome. Dynamic regions (#bubbles, #drawer-items,
+   #add-content) are filled only with server-validated projections. */
+#app-shell { max-width: 46rem; margin: 0 auto; font-family: sans-serif; }
+#app-header { display: flex; justify-content: space-between; padding: .5rem; }
+#connection-status[data-state="down"] { color: #a00; }
+#bubbles article { border: 1px solid #ccc; margin: .4rem 0; padding: .4rem; }
+#composer { display: flex; gap: .4rem; padding: .5rem 0; }
+#composer-input { flex: 1; }
+#frag-frame { width: 100%; border: 0; }

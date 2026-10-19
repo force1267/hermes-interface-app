@@ -36,23 +36,27 @@ def _bootstrap_envelope(mtype, body, caps=(), fallback="handshake",
     return env
 
 
-def mk_hello(client_id, supported_versions, caps=(), registry_revision=None,
-             budget_revision=None):
+def mk_hello(client_id, supported_versions, caps=(),
+             registry_revision=None, budget_revision=None, extra=None):
     body = {"client_id": client_id,
             "supported_versions": [dict(v) for v in supported_versions],
             "caps": list(caps), "registry_revision": registry_revision,
             "budget_revision": budget_revision}
+    if extra:
+        body.update(dict(extra))
     return _bootstrap_envelope("hello", body, caps=caps,
                                msg_id=f"hello-{client_id}")
 
 
 def mk_resume(client_id, supported_versions, caps=(), registry_revision=None,
-              budget_revision=None, last_seen=(), cursor=None):
+              budget_revision=None, last_seen=(), cursor=None, extra=None):
     body = {"client_id": client_id,
             "supported_versions": [dict(v) for v in supported_versions],
             "caps": list(caps), "registry_revision": registry_revision,
             "budget_revision": budget_revision,
             "last_seen": [dict(e) for e in last_seen], "cursor": cursor}
+    if extra:
+        body.update(dict(extra))
     return _bootstrap_envelope("resume", body, caps=caps,
                                msg_id=f"resume-{client_id}")
 
