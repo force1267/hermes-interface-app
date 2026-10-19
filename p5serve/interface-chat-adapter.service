@@ -5,28 +5,32 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=interface-app
-Group=interface-app
+# Runs as root (same as hermes-gateway on this box): /root is mode 0700,
+# so a dedicated service user cannot reach the proven P0 binding path
+# (hermes binary via /root/.local/bin, MJ credentials in /root/.hermes).
+# Loopback-only bind is enforced in code (adapter refuses non-127.0.0.1).
+User=root
+Group=root
 # Secrets provisioned outside source control, service-user readable:
 #   /etc/interface-app/mj-password.json (mode 0600)
 #   /etc/interface-app/provider-secret (mode 0600)
 #   /etc/interface-app/settings.json (this template filled in)
 ExecStart=/usr/bin/python3 -m p5serve.serve /etc/interface-app/settings.json
 WorkingDirectory=/opt/interface-app/releases/current
+Environment=PYTHONPATH=/opt/interface-app/releases/current
 Restart=on-failure
 RestartSec=5
 # State lives outside release dirs; survives symlink swaps + reboot.
 StateDirectory=interface-app
 LogsDirectory=interface-app
+# Minimal sandboxing: PrivateTmp + NoNewPrivileges only. Heavier
+# lockdown (ProtectHome/ProtectSystem/IPAddressDeny) is deliberately NOT
+# applied: the in-process provider spawns the real Hermes CLI, which needs
+# read/write under /root/.hermes and real egress for model calls.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/interface-app
 # Loopback only: no public bind. Caddy terminates TLS and routes only
 # /app/ws on the chat.typeacid.ir block to 127.0.0.1:9120.
-IPAddressAllow=127.0.0.1
-IPAddressDeny=any
 
 [Install]
 WantedBy=multi-user.target
