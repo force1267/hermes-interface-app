@@ -74,12 +74,17 @@ try {
     ws.onerror = (e) => { clearTimeout(t); rej(e); };
   });
   let id = 0; const pending = new Map(); const contexts = [];
-  const netReqs = []; const docHeaders = {}; const wsUrls = [];
+  const netReqs = []; const docHeaders = {}; const wsUrls = []; const wsFrames = [];
+  const debugPort = port;
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
-    if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
+    try {
+      const key = (m.sessionId || '') + ':' + m.id;
+      if (m.id !== undefined && pending.has(key)) { pending.get(key)(m); pending.delete(key); return; }
+    } catch { return; }
     if (m.method === 'Network.requestWillBeSent') netReqs.push(m.params.request.url);
     if (m.method === 'Network.webSocketCreated') wsUrls.push(m.params.url);
+    if (m.method === 'Network.webSocketFrameReceived' && m.params.response && typeof m.params.response.payloadData === 'string') wsFrames.push(m.params.response.payloadData);
     if (m.method === 'Network.responseReceived' && m.params.type === 'Document') {
       docHeaders[m.params.response.url] = m.params.response.headers;
     }
@@ -87,11 +92,68 @@ try {
   };
   const call = (method, params = {}, timeoutMs = 15000) => new Promise((resolve, reject) => {
     const n = ++id;
-    const t = setTimeout(() => { if (pending.has(n)) { pending.delete(n); reject(Error('cdp-timeout:' + method)); } }, timeoutMs);
-    pending.set(n, (x) => { clearTimeout(t); x.error ? reject(Error(JSON.stringify(x.error))) : resolve(x.result); });
+    const t = setTimeout(() => { if (pending.has(':' + n)) { pending.delete(':' + n); reject(Error('cdp-timeout:' + method)); } }, timeoutMs);
+    pending.set(':' + n, (x) => { clearTimeout(t); x.error ? reject(Error(JSON.stringify(x.error))) : resolve(x.result); });
     try { ws.send(JSON.stringify({ id: n, method, params })); }
-    catch (e) { clearTimeout(t); pending.delete(n); reject(e); }
+    catch (e) { clearTimeout(t); pending.delete(':' + n); reject(e); }
   });
+  const callSess = (sessionId, method, params = {}, timeoutMs = 15000) => new Promise((resolve, reject) => {
+    const n = ++id;
+    const key = sessionId + ':' + n;
+    const t = setTimeout(() => { if (pending.has(key)) { pending.delete(key); reject(Error('cdp-timeout:' + method)); } }, timeoutMs);
+    pending.set(key, (x) => { clearTimeout(t); x.error ? reject(Error(JSON.stringify(x.error))) : resolve(x.result); });
+    try { ws.send(JSON.stringify({ id: n, sessionId, method, params })); }
+    catch (e) { clearTimeout(t); pending.delete(key); reject(e); }
+  });
+  // Evaluate inside the sandboxed OOPIF via its own CDP target session.
+  // The opaque-origin srcdoc frame runs out-of-process, so the page
+  // target cannot evaluate in it directly.
+  const evFrame = async (expr) => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const tabs = await (await fetch('http://127.0.0.1:' + debugPort + '/json')).json();
+        const cands = tabs.filter((t) => t.type === 'iframe' && (t.url || '').indexOf('about:srcdoc') === 0);
+        if (!cands.length) throw Error('no-iframe-target');
+        for (let ci = cands.length - 1; ci >= 0; ci--) {
+          const a = await call('Target.attachToTarget', { targetId: cands[ci].id, flatten: true });
+          const sid = a.sessionId;
+          try {
+            const r = await callSess(sid, 'Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
+            if (r && r.exceptionDetails) { lastErr = Error('frame-exc'); continue; }
+            return (r && r.result && ('value' in r.result)) ? r.result.value : null;
+          } catch (e) { lastErr = e; }
+          finally {
+            try { await call('Target.detachFromTarget', { sessionId: sid }); } catch {}
+          }
+        }
+        throw lastErr || Error('no-live-iframe-target');
+      } catch (e) {
+        lastErr = e;
+        await sleep(1000);
+      }
+    }
+    throw lastErr;
+  };
+  // Persistent frame session for polls: attach once, evaluate many times,
+  // re-attach when the frame navigates. Returns {read} and {post}.
+  const frameLink = async () => {
+    const tabs = await (await fetch('http://127.0.0.1:' + debugPort + '/json')).json();
+    const cands = tabs.filter((t) => t.type === 'iframe' && (t.url || '').indexOf('about:srcdoc') === 0);
+    if (!cands.length) throw Error('no-iframe-target');
+    const a = await call('Target.attachToTarget', { targetId: cands[cands.length - 1].id, flatten: true });
+    const sid = a.sessionId;
+    let alive = true;
+    const run = async (expr) => {
+      const r = await callSess(sid, 'Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
+      if (r && r.exceptionDetails) throw Error('frame-exc');
+      return (r && r.result && ('value' in r.result)) ? r.result.value : null;
+    };
+    return {
+      read: run,
+      close: async () => { if (alive) { alive = false; try { await call('Target.detachFromTarget', { sessionId: sid }); } catch {} } },
+    };
+  };
   await call('Page.enable'); await call('Runtime.enable'); await call('Network.enable');
   const jsErrors = [];
   ws.addEventListener('message', (e) => {
@@ -159,7 +221,7 @@ try {
     const waitReadyish = async () => {
       for (let i = 0; i < 60; i++) {
         const s = String(await ev(`document.getElementById('connection-status').textContent`));
-        if (/down|unavailable/i.test(s)) return s;
+        if (/unavailable/i.test(s)) return s;
         await sleep(1000);
       }
       return String(await ev(`document.getElementById('connection-status').textContent`));
@@ -174,11 +236,34 @@ try {
     await navLoad(baseUrl + '/');
     for (let i = 0; i < 60; i++) {
       const s = String(await ev(`document.getElementById('connection-status').textContent`));
-      if (/down|unavailable|ready/i.test(s)) break;
+      if (/unavailable/i.test(s)) break;
       await sleep(1000);
     }
     const draft = await ev(`document.getElementById('composer-input').value`);
     check('draft retained across reload on dead backend', draft === 'DRAFT-KEEP-DEAD', String(draft).slice(0, 40));
+  } else if (mode === 'expiry') {
+    const waitReadyX = async () => {
+      for (let i = 0; i < 90; i++) {
+        const s = String(await ev(`document.getElementById('connection-status').textContent`));
+        if (s.indexOf('ready') === 0) return s;
+        await sleep(1000);
+      }
+      return String(await ev(`document.getElementById('connection-status').textContent`));
+    };
+    const status = await waitReadyX();
+    check('login works, socket ready (expiry run)', status.indexOf('ready') === 0, status);
+    if (status.indexOf('ready') !== 0) throw Error('never ready: ' + status);
+    let end = status, dis = false;
+    for (let i = 0; i < 45; i++) {
+      end = String(await ev(`document.getElementById('connection-status').textContent`));
+      dis = await ev(`document.getElementById('composer-send').disabled`);
+      if (/down|reconnecting/.test(end) && dis === true) break;
+      await sleep(1000);
+    }
+    check('expired session drops the socket, send disabled', /down|reconnecting/.test(end) && dis === true, end + ' disabled=' + dis);
+    await navLoad(baseUrl + '/app/ws');
+    const loginHtml2 = await ev('document.documentElement.outerHTML');
+    check('expired session returns to sign-in', /sign in/.test(loginHtml2), String(loginHtml2).slice(0, 120));
   } else {
     const waitReady = async () => {
       for (let i = 0; i < 90; i++) {
@@ -193,7 +278,7 @@ try {
     if (status.indexOf('ready') !== 0) throw Error('never ready: ' + status);
     // composer node marker for incremental-update check
     await ev(`document.getElementById('composer').dataset.mark='m1'; document.getElementById('composer-input').focus();`);
-    await ev(`document.getElementById('composer-input').value = 'BROWSER-SEND ${nonce} please confirm receipt'; document.getElementById('composer-send').click();`);
+    await ev(`document.getElementById('composer-input').value = 'Reply with only this exact line and nothing else: ACK ${nonce}'; document.getElementById('composer-send').click();`);
     let bubbleText = '';
     for (let i = 0; i < 150; i++) {
       const arts = await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => a.innerText).join('\\n---\\n')`);
@@ -213,37 +298,156 @@ try {
     await waitReady();
     const draft = await ev(`document.getElementById('composer-input').value`);
     check('draft retained across reload', draft === 'DRAFT-KEEP-1', String(draft).slice(0, 40));
-    // frame bridge: source-checked, op allowlist, no auth in frame
-    const tree = await frameTree();
-    const kids = tree.childFrames || [];
-    check('exactly one reusable iframe', kids.length === 1, String(kids.length));
+    // frame host: single reusable iframe, srcdoc mounted, real render
+    // (opaque-origin srcdoc frames run JS but stay out of the CDP frame
+    // tree, so the frame is located via DOM + its execution context)
+    const frameCount = await ev(`document.querySelectorAll('iframe').length`);
+    const getFrameId = async () => {
+      try {
+        const doc = await call('DOM.getDocument', { depth: 0 });
+        const q = await call('DOM.querySelector', { nodeId: doc.root.nodeId, selector: 'iframe' });
+        if (!q || !q.nodeId) return null;
+        const d = await call('DOM.describeNode', { nodeId: q.nodeId });
+        return (d.node && d.node.frameId) || null;
+      } catch { return null; }
+    };
+    const fid = await getFrameId();
+    check('exactly one reusable iframe', frameCount === 1 && !!fid, 'count=' + frameCount + ' frameId=' + !!fid);
     const sandbox = await ev(`document.querySelector('iframe').getAttribute('sandbox')`);
     check('frame sandbox exactly allow-scripts', sandbox === 'allow-scripts', String(sandbox));
-    const fid = kids[0] && kids[0].frame.id;
-    const fctx = fid ? await frameCtx(fid) : null;
-    check('frame context visible', !!fctx);
-    if (fctx) {
+    const srcdocLen = await ev(`(document.querySelector('iframe').getAttribute('srcdoc') || '').length`);
+    check('frame srcdoc mounted', srcdocLen > 1000, String(srcdocLen));
+    let frameAlive = false;
+    try { await evFrame(`'alive'`); frameAlive = true; } catch {}
+    check('frame context visible', frameAlive);
+    // render delivered into the frame: nonce text inside frame doc,
+    // read over one persistent target session (re-attached on navigate)
+    let frameText = '';
+    let link = null;
+    for (let i = 0; i < 30; i++) {
+      try {
+        if (!link) link = await frameLink();
+        frameText = String(await link.read(`document.getElementById('r').innerText`) || '');
+      } catch {
+        try { if (link) await link.close(); } catch {}
+        link = null;
+      }
+      if (frameText.indexOf(nonce) >= 0) break;
+      await sleep(1000);
+    }
+    try { if (link) await link.close(); } catch {}
+    check('frame render delivers nonce answer', frameText.indexOf(nonce) >= 0, frameText.slice(0, 200));
+    {
       const before = await ev(`document.getElementById('connection-status').textContent`);
-      await ev(`parent.postMessage({op:'bogus-op-xyz'},'*')`, fctx);
+      await evFrame(`parent.postMessage({op:'bogus-op-xyz'},'*')`);
       await sleep(800);
       const after = await ev(`document.getElementById('connection-status').textContent`);
       check('bogus frame op ignored', before === after, before + ' -> ' + after);
-      await ev(`parent.postMessage({op:'action', action_id:'a.evil'},'*')`, fctx);
-      let acted = '';
-      for (let i = 0; i < 30; i++) {
-        acted = String(await ev(`document.getElementById('connection-status').textContent`));
-        if (/actions-disabled/.test(acted)) break;
-        await sleep(1000);
+      // welcome token captured off the real socket frames
+      let tok = null, fcx = null;
+      for (let i = 0; i < 40 && !tok; i++) {
+        for (const f of wsFrames) {
+          try { const m = JSON.parse(f); if (m.op === 'welcome' && m.body && m.body.frame_token) { tok = m.body.frame_token; fcx = m.body.frame_context; } } catch {}
+        }
+        if (!tok) await sleep(500);
       }
-      check('frame action forwarded through domain validation', /actions-disabled/.test(acted), acted);
-      await ev(`parent.postMessage({op:'resize', height:5000},'*')`, fctx);
+      await evFrame(`parent.postMessage({op:'action-click', action_id:'a.evil'},'*')`);
+      await sleep(800);
+      const ignored = await ev(`document.getElementById('connection-status').textContent`);
+      check('tokenless frame action ignored', ignored === after, String(ignored));
+      if (tok) {
+        await evFrame(`parent.postMessage({op:'action-click', token:${JSON.stringify(tok)}, context:${JSON.stringify(fcx)}, action_id:'a.evil', fragment_id:'f-x'},'*')`);
+        let acted = '';
+        for (let i = 0; i < 30; i++) {
+          acted = String(await ev(`document.getElementById('connection-status').textContent`));
+          if (/unknown-action/.test(acted)) break;
+          await sleep(1000);
+        }
+        check('frame action forwarded through domain validation', /unknown-action/.test(acted), acted);
+      } else {
+        check('frame action forwarded through domain validation', false, 'no welcome token captured');
+      }
+      await evFrame(`parent.postMessage({op:'resize', height:5000},'*')`);
       await sleep(500);
       const h = await ev(`document.getElementById('frag-frame').style.height`);
       check('frame resize clamped to configured max', h === '800px', String(h));
     }
+    // reload mid-send: second nonce, reload before completion, no dup/loss
+    await ev(`document.getElementById('composer-input').value = 'Reply with only this exact line and nothing else: ACK ${nonce}-reload'; document.getElementById('composer-send').click();`);
+    await sleep(2000);
+    await navLoad(baseUrl + '/');
+    const status2 = await waitReady();
+    check('reconnect after reload mid-send', status2.indexOf('ready') === 0, status2);
+    let arts2 = '';
+    for (let i = 0; i < 150; i++) {
+      arts2 = String(await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => (a.querySelector('strong') ? a.querySelector('strong').innerText : '') + '|' + (a.querySelector('p') ? a.querySelector('p').innerText : '')).join('\\n')`));
+      if (arts2.indexOf(nonce + '-reload') >= 0) break;
+      await sleep(1000);
+    }
+    const hermesHits = arts2.split('\n').filter((l) => l.indexOf('hermes|') === 0 && l.indexOf(nonce + '-reload') >= 0).length;
+    const youHits = arts2.split('\n').filter((l) => l.indexOf('you|') === 0 && l.indexOf(nonce + '-reload') >= 0).length;
+    check('reload mid-send: answer arrives exactly once', hermesHits === 1 && youHits === 1, 'hermes=' + hermesHits + ' you=' + youHits);
+    // connection loss and recovery: drop the socket, backoff reconnects
+    // (the reconnect lands in under a second, faster than a status poll,
+    // so the proof is a fresh welcome on the wire plus a ready socket)
+    const welcomesBefore = wsFrames.filter((f) => f.indexOf('"welcome"') >= 0).length;
+    await ev(`try { window.__chatWs.close(); } catch (e) {}`);
+    const status3 = await waitReady();
+    let welcomesAfter = welcomesBefore;
+    for (let i = 0; i < 30; i++) {
+      welcomesAfter = wsFrames.filter((f) => f.indexOf('"welcome"') >= 0).length;
+      if (welcomesAfter > welcomesBefore) break;
+      await sleep(1000);
+    }
+    check('socket drop reconnects with fresh welcome', welcomesAfter > welcomesBefore, 'welcomes ' + welcomesBefore + ' -> ' + welcomesAfter);
+    check('backoff recovery returns to ready', status3.indexOf('ready') === 0, status3);
+    // wrong-origin upgrade rejection: raw client against this live stack
+    // (browsers cannot forge Origin; S005 covers origin strings in depth)
+    const { request: httpRequest } = await import('node:http');
+    const rawReject = await new Promise((res) => {
+      try {
+        const u = new URL(baseUrl);
+        const req = httpRequest({ host: '127.0.0.1', port: u.port, path: '/app/ws', method: 'GET',
+          headers: { Host: u.host, Upgrade: 'websocket', Connection: 'Upgrade',
+            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version': '13',
+            Origin: 'https://evil.test', 'Sec-WebSocket-Protocol': 'hermes.web.v1' } });
+        req.on('response', (r) => { r.resume(); res(r.statusCode); });
+        req.on('error', () => res('error'));
+        req.setTimeout(10000, () => { try { req.destroy(); } catch {} res('timeout'); });
+        req.end();
+      } catch (e) { res('harness-error'); }
+    });
+    check('wrong-origin upgrade rejected', rawReject === 403, String(rawReject));
+    // untrusted frame content cannot execute under the page CSP
+    const cspProbe = await ev(`new Promise((res) => {
+      var got = [];
+      var h = function(e){ got.push(String(e.data)); };
+      window.addEventListener('message', h);
+      var f = document.createElement('iframe');
+      f.setAttribute('sandbox', 'allow-scripts');
+      f.srcdoc = '<script>parent.postMessage("probe-alive", "*");</scr' + 'ipt>';
+      document.body.appendChild(f);
+      setTimeout(function(){
+        window.removeEventListener('message', h);
+        try { f.remove(); } catch (x) {}
+        res(JSON.stringify(got));
+      }, 2500);
+    })`);
+    check('untrusted frame script blocked by CSP', cspProbe === '[]', String(cspProbe).slice(0, 120));
+    // drawer persistence across reload
+    const drawerBefore = await ev(`Array.from(document.querySelectorAll('#drawer-items li')).map((li) => li.textContent).join('|')`);
+    await navLoad(baseUrl + '/');
+    await waitReady();
+    const drawerAfter = await ev(`Array.from(document.querySelectorAll('#drawer-items li')).map((li) => li.textContent).join('|')`);
+    check('drawer list stable across reload', drawerBefore === drawerAfter && drawerBefore.length > 0, drawerBefore + ' -> ' + drawerAfter);
   }
   report.netUrls = netReqs;
   report.wsUrls = wsUrls;
+  try {
+    report.lastClose = await ev(`(function(){ try { return sessionStorage.getItem('chat-last-close'); } catch (e) { return 'nostore'; } })()`);
+    report.closeLog = await ev(`(function(){ try { return sessionStorage.getItem('chat-close-log'); } catch (e) { return 'nostore'; } })()`);
+    report.welcomes = wsFrames.filter((f) => f.indexOf('"welcome"') >= 0).length;
+  } catch {}
 } catch (e) {
   report.errors.push(String((e && e.message) || e));
 } finally {

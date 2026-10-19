@@ -73,8 +73,9 @@ def make_settings(tmp, provider_port, secret="svc-secret-1", **over):
             "http_timeout_seconds": 10, "frame_bytes": 1048576,
             "json_depth": 64, "write_timeout_seconds": 10,
             "sqlite_busy_seconds": 2, "outbound_messages": 64,
-            "outbound_bytes": 2097152, "queue_safety_messages": 64,
-            "queue_safety_bytes": 2097152, "ws_ping_seconds": 20,
+            "outbound_bytes": 2097152,            "queue_safety_messages": 64,
+            "queue_safety_bytes": 2097152, "retry_after_seconds": 60,
+            "ws_ping_seconds": 20,
             "ws_pong_timeout_seconds": 10, "session_check_seconds": 1,
             "credential_check_seconds": 1, "reconnect_base_seconds": 1,
             "reconnect_factor": 2, "reconnect_cap_seconds": 30,
@@ -398,7 +399,7 @@ def _node_chrome():
     return node, chrome
 
 
-def _browser_stack(provider=True):
+def _browser_stack(provider=True, settings_over=None):
     """Standalone stack for the real-Chrome gate (localhost origin so
     the Secure host-only cookie is trustworthy without TLS)."""
     tmp = tempfile.mkdtemp(prefix="p5b")
@@ -419,11 +420,23 @@ def _browser_stack(provider=True):
         hp = HermesProvider(psettings, os.path.join(tmp, "hp.sqlite3"),
                              secret, account_id="mj")
         pport = hp.start("127.0.0.1", 0)
-    spath = make_settings(tmp, pport, secret=secret)
+    spath = make_settings(tmp, pport, secret=secret,
+                          **(settings_over or {}))
     srv = adaptermod.AdapterServer(spath)
     port = srv.start()
     srv.origin = "http://localhost:%d" % port
     srv.host = "localhost:%d" % port
+    # seed one durable drawer page so the browser gate can prove
+    # drawer persistence across reload from real backend state
+    from p3drawer import ops as drawer_ops
+    seed = drawer_ops.handle_op(
+        srv.drawer,
+        {"op": "add", "name": "gate-seed",
+         "tree": {"component": "Text",
+                  "props": {"text": "seed page"},
+                  "children": []},
+         "kind": "text", "fallback_text": "seed page"})
+    assert seed.get("status") == "ok", seed
     base = "http://localhost:%d" % port
     return {"tmp": tmp, "srv": srv, "hp": hp, "port": port,
             "base": base}
@@ -508,9 +521,10 @@ class T_S002_DomainOwnership(ServingBase):
         done = ws.wait_op("outcome", timeout=15)
         self.assertIsNotNone(done)
         self.assertEqual(done["body"]["status"], "completed")
-        # upstream fixture really got the text payload (p0 translation)
-        self.assertTrue(any(
-            True for _ in [self.provider.acked_list()]))
+        # upstream fixture really got the text payload (p0 translation):
+        # the acked envelope id resolves and the client recorded the text.
+        acked = self.provider.acked_list()
+        self.assertTrue(acked)
         snap = None
         ws.send({"v": 1, "kind": "command", "request_id": "s2",
                  "client_id": w["client_id"],
@@ -519,7 +533,44 @@ class T_S002_DomainOwnership(ServingBase):
         snap = ws.wait_op("snapshot", timeout=10)
         self.assertTrue(any(b["text"] == "hello-domain"
                             for b in snap["body"]["bubbles"]))
+        # p1chat seam: send control is text-driven, voice only when empty
+        from p1chat.surface import composer_mode
+        self.assertTrue(composer_mode("hello-domain")["send_enabled"])
+        self.assertFalse(composer_mode("  ")["send_enabled"])
+        # p2rich seam: the completed assistant bubble carries a real
+        # bounded preview rendered server-side from the terminal result
+        assist = [b for b in snap["body"]["bubbles"]
+                  if b.get("role") == "assistant"]
+        self.assertTrue(assist and assist[0]["preview_html"])
+        self.assertIn("bubble", assist[0]["preview_html"])
+        # p3drawer seam: backend-owned pages read through drawer.read
+        from p3drawer import ops as drawer_ops
+        res = drawer_ops.handle_op(
+            self.srv.drawer,
+            {"op": "add", "name": "S02 page",
+             "tree": {"component": "Text", "props": {"text": "hi"},
+                      "children": []},
+             "kind": "text", "fallback_text": "hi page"})
+        self.assertEqual(res.get("status"), "ok")
+        ws.send({"v": 1, "kind": "command", "request_id": "s2d",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "drawer.read", "body": {}})
+        patches = []
+        end = time.time() + 10
+        while time.time() < end and len(patches) < 1:
+            m = ws.wait_op("patch", timeout=2)
+            if m is not None and \
+                    m["body"].get("region") == "drawer-items":
+                patches.append(m)
+        self.assertTrue(patches)
+        self.assertTrue(any(i.get("label") == "S02 page"
+                            for i in patches[0]["body"]["items"]))
+        # p4ops seam: admission policy owns queue depth, not the adapter
+        self.assertEqual(self.srv.policy.get("revision"), "p1")
         # no generic URL-fetch proxy, no browser-selected destination
+        self.assertEqual(ws.wait_op("outcome", timeout=10)["body"][
+            "status"], "completed")  # drain drawer.read outcome
         ws.send({"v": 1, "kind": "command", "request_id": "s3",
                  "client_id": w["client_id"],
                  "generation": w["generation"], "csrf": w["body"]["csrf"],
@@ -543,8 +594,28 @@ class T_S003_NativeAuth(ServingBase):
         st2, hdrs2 = do_login(self.port, "wrong-pw")
         self.assertEqual(st2, 401)
         self.assertEqual(session_cookie(hdrs2), "")
-        # single-use challenge: replay same preauth fails
-        st3, _ = do_login(self.port, "correct-horse")
+        # single-use challenge: capturing one challenge and spending it
+        # twice must fail the replay; a fresh challenge still logs in
+        st, hdrs, body = http_request(self.port, "GET", "/app/ws")
+        pre = ""
+        for c in hdrs.get("set-cookie", []):
+            if c.startswith("__Host-chat-pre="):
+                pre = c.split(";", 1)[0]
+        m = re.search(r'name="csrf" value="([^"]+)"', body.decode())
+        form = urllib.parse.urlencode(
+            {"op": "login", "username": "mj", "password": "correct-horse",
+             "csrf": m.group(1)}).encode()
+        st2, hdrs2, _ = http_request(
+            self.port, "POST", "/app/ws",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Origin": ORIGIN, "Cookie": pre}, form)
+        self.assertEqual(st2, 303)
+        replay, _, _ = http_request(
+            self.port, "POST", "/app/ws",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Origin": ORIGIN, "Cookie": pre}, form)
+        self.assertEqual(replay, 401)
+        self.assertEqual(session_cookie(hdrs2) != "", True)
         # fresh login works
         st4, hdrs4 = do_login(self.port, "correct-horse")
         self.assertEqual(st4, 303)
@@ -661,13 +732,19 @@ class T_S006_CsrfWrites(ServingBase):
         ws2 = WSClient(self, self.port, cookie=ck)
         self.addCleanup(ws2.close)
         self.assertEqual(ws2.status, 101)
-        # frame bundle never carries auth material
+        # frame bundle never carries auth material; parent posts only to
+        # the fenced frame element (channel token/context), never auth
+        # cookies or bearer material, and never to the open page
         from p2rich.sandbox import FRAME_JS
         for secret_word in ("csrf", "cookie", "__Host-chat"):
             self.assertNotIn(secret_word, FRAME_JS)
-            with open(os.path.join(adaptermod.STATIC_DIR,
-                                   "app.js")) as f:
-                self.assertNotIn("contentWindow.postMessage", f.read())
+        with open(os.path.join(adaptermod.STATIC_DIR, "app.js")) as f:
+            js = f.read()
+        self.assertIn("frame.contentWindow.postMessage", js)
+        self.assertNotIn("localStorage", js)
+        self.assertNotIn("__Host-chat", js)
+        self.assertNotIn("document.cookie", js)
+        self.assertIn("action-click", js)
 
 
 class T_S007_RevocationExpiry(ServingBase):
@@ -702,6 +779,47 @@ class T_S007_RevocationExpiry(ServingBase):
         ws3 = WSClient(self, self.port, cookie=ck2)
         self.addCleanup(ws3.close)
         self.assertEqual(ws3.status, 401)
+
+    def test_s007_expiry_browser(self):
+        # Idle expiry in a real browser: socket drops, send disables,
+        # and the session returns to sign-in (no silent logged-out chat).
+        node, chrome = _node_chrome()
+        st = _browser_stack(
+            provider=True,
+            settings_over={
+                "auth": {"idle_seconds": 3},
+                "adapter": {"session_check_seconds": 1,
+                            "credential_check_seconds": 1}})
+        tmp = st["tmp"]
+        try:
+            userdir = tempfile.mkdtemp(prefix="p5chrome-expiry")
+            out = os.path.join(tmp, "expiry-report.json")
+            proc = subprocess.run(
+                [node, "tests/p5_browser_gate.mjs", st["base"], chrome,
+                 userdir, "expiry", "none", out, "correct-horse"],
+                capture_output=True, text=True, timeout=300)
+            self.assertTrue(os.path.exists(out),
+                            "expiry gate produced no report: %s %s" %
+                            (proc.returncode, (proc.stderr or "")[-500:]))
+            with open(out) as f:
+                rep = json.load(f)
+            for name in ("login works, socket ready (expiry run)",
+                         "expired session drops the socket, send disabled",
+                         "expired session returns to sign-in"):
+                self.assertEqual(rep["checks"].get(name), "pass",
+                                 "%s :: %s" % (name, rep["checks"].get(
+                                     name)))
+        finally:
+            try:
+                st["srv"].stop()
+            except Exception:
+                pass
+            try:
+                if st["hp"] is not None:
+                    st["hp"].stop()
+            except Exception:
+                pass
+            shutil.rmtree(tmp, True)
 
 
 class T_S008_PasswordRateLimits(ServingBase):
@@ -765,6 +883,15 @@ class T_S009_Envelopes(ServingBase):
         w = attach(ws)
         for key in ("csrf", "release_id", "protocol"):
             self.assertIn(key, w["body"])
+        # R4: runtime client knobs ride the welcome, frame creds rotate
+        pol = w["body"].get("client_policy", {})
+        for key in ("draft_bytes", "reconnect_base_seconds",
+                    "reconnect_factor", "reconnect_cap_seconds",
+                    "reconnect_stable_seconds", "frame_min_height",
+                    "frame_max_height", "frame_ready_timeout_seconds"):
+            self.assertIn(key, pol)
+        self.assertTrue(w["body"].get("frame_token"))
+        self.assertTrue(w["body"].get("frame_context"))
         # duplicate keys rejected (raw frame with dup key)
         dup = (b'{"v":1,"kind":"command","request_id":"d1",'
                b'"client_id":null,"generation":0,"csrf":null,'
@@ -966,7 +1093,10 @@ class T_S012_BindingRealHermes(ServingBase):
             "SELECT result_json FROM requests WHERE state='completed'"
             ).fetchall()
         texts = [json.loads(r[0])["text"] for r in rows]
-        self.assertTrue(any(t and t in rep.get("bubbleText", "")
+        # durable terminal text (leading slice; the report truncates the
+        # DOM capture) appears verbatim in the rendered bubbles
+        self.assertTrue(any(t and t[:200] and
+                            t[:200] in rep.get("bubbleText", "")
                             for t in texts),
                         "no durable terminal result matches DOM bubble")
 
@@ -1211,6 +1341,27 @@ class T_S016_FailClosed(ServingBase):
                  "body": {"conversation_id": conv, "text": "hi"}})
         rej = ws.wait_op("outcome", timeout=15)
         self.assertEqual(rej["body"]["code"], "backend-unavailable")
+        # full inbound queue saturates admission with busy, not acceptance
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        qmax = self.srv.policy["queue_max_messages"]
+        for i in range(qmax):
+            self.srv.pending["qfill-%d" % i] = {
+                "state": "accepted", "client_id": w["client_id"],
+                "payload_hash": "h-%d" % i}
+        ws.send({"v": 1, "kind": "command", "request_id": "w4",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "overflow"}})
+        rej = ws.wait_op("outcome", timeout=15)
+        self.assertEqual(rej["body"]["code"], "busy")
+        self.assertEqual(rej["body"]["status"], "rejected")
 
 
 class T_S017_SlowConsumer(ServingBase):
@@ -1229,8 +1380,66 @@ class T_S017_SlowConsumer(ServingBase):
         self.addCleanup(ws2.close)
         self.assertEqual(ws2.status, 101)
 
+    def test_s017_outstanding_not_lifetime(self):
+        # Outstanding (unreceipted) backpressure: a reader that receipts
+        # stays alive indefinitely under the same bound that fences a
+        # silent consumer. Lifetime accounting would kill both.
+        self.start_stack(settings_over={
+            "adapter": {"outbound_messages": 8,
+                        "outbound_bytes": 1048576}})
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws, req="a1")
+        snap = ws.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap)
+        conv = snap["body"]["conversation_id"]
+        self.assertEqual(ws.wait_close(timeout=2), None)
+        # receipt the snapshot: outstanding drains, further events flow
+        last = snap["event_seq"] if "event_seq" in snap else 2
+        ws.send({"v": 1, "kind": "command", "request_id": "r1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": None,
+                 "op": "receipt", "body": {"event_seq": last}})
+        rok = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rok["body"]["status"], "completed")
+        ws.send({"v": 1, "kind": "command", "request_id": "s1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"],
+                 "csrf": w["body"]["csrf"],
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "steady"}})
+        acc = ws.wait_op("outcome", timeout=15)
+        self.assertEqual(acc["body"]["status"], "accepted")
+        done = ws.wait_op("outcome", timeout=30)
+        self.assertEqual(done["body"]["status"], "completed")
+        self.assertEqual(ws.wait_close(timeout=2), None)
+        # same socket, no receipts at all: the bound eventually fences
+        self.start_stack(settings_over={
+            "adapter": {"outbound_messages": 3,
+                        "outbound_bytes": 1048576}})
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws, req="a1")
+        ws.wait_op("snapshot", timeout=10)
+        conv = self.srv.clients[w["client_id"]]["conversation_id"]
+        for i in range(4):
+            ws.send({"v": 1, "kind": "command",
+                     "request_id": "f%d" % i,
+                     "client_id": w["client_id"],
+                     "generation": w["generation"],
+                     "csrf": w["body"]["csrf"], "op": "chat.send",
+                     "body": {"conversation_id": conv,
+                             "text": "fill-%d" % i}})
+            acc = ws.wait_op("outcome", timeout=5)
+            if acc is None or acc["body"]["status"] != "accepted":
+                break
+        code, _ = ws.wait_close(timeout=15) or (None, None)
+        self.assertEqual(code, 1013)
 
-class T_S018_StoreFailure(unittest.TestCase):
+
+class T_S018_StoreFailure(ServingBase):
     def test_s018_store_failure(self):
         tmp = tempfile.mkdtemp(prefix="p5f")
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -1263,6 +1472,48 @@ class T_S018_StoreFailure(unittest.TestCase):
                 "policy": {"file": path}}, f)
         with self.assertRaises(Exception):
             adaptermod.AdapterServer(path)
+        # runtime store failure fails closed: live socket first, then the
+        # state db becomes an unwritable directory mid-run
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+        w = attach(ws)
+        snap = ws.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap)
+        conv = snap["body"]["conversation_id"]
+        db_path = self.srv.cfg["adapter"]["state_db"]
+        os.rename(db_path, db_path + ".bak")
+        os.mkdir(db_path)
+        try:
+            ws2 = WSClient(self, self.port, cookie=ck)
+            self.addCleanup(ws2.close)
+            self.assertEqual(ws2.status, 101)
+            ws2.send({"v": 1, "kind": "command",
+                      "request_id": "store1", "client_id": None,
+                      "generation": 0, "csrf": None, "op": "attach",
+                      "body": {"tab_id": "tab-store",
+                             "release_id": RELEASE,
+                             "cursor_hint": None}})
+            code, _ = ws2.wait_close(timeout=10) or (None, None)
+            self.assertEqual(code, 1011)
+            # the already-live socket: writes are admitted but never
+            # reported completed once durable history cannot persist
+            ws.send({"v": 1, "kind": "command", "request_id": "u9",
+                     "client_id": w["client_id"],
+                     "generation": w["generation"],
+                     "csrf": w["body"]["csrf"], "op": "chat.send",
+                     "body": {"conversation_id": conv, "text": "stored?"}})
+            acc = ws.wait_op("outcome", timeout=15)
+            self.assertIsNotNone(acc)
+            self.assertEqual(acc["body"]["status"], "accepted")
+            out = ws.wait_op("outcome", timeout=30)
+            self.assertIsNotNone(out)
+            self.assertEqual(out["body"]["status"], "outcome-unknown")
+        finally:
+            shutil.rmtree(db_path)
+            os.rename(db_path + ".bak", db_path)
 
 
 class T_S019_ResumeRecords(ServingBase):
@@ -1462,6 +1713,74 @@ class T_S022_SplitLiveness(ServingBase):
         self.assertIsNotNone(done)
         self.assertEqual(done["body"]["status"], "completed")
 
+    def test_s022_silent_peer_timeout(self):
+        # A connected socket that never answers pings must be fenced by
+        # the configured pong deadline, not held open indefinitely.
+        self.start_stack(settings_over={
+            "adapter": {"ws_ping_seconds": 1,
+                        "ws_pong_timeout_seconds": 1}})
+        ck = self.login()
+        raw = socket.create_connection(("127.0.0.1", self.port),
+                                       timeout=10)
+        raw.sendall(
+            f"GET /app/ws HTTP/1.1\r\nHost: {HOST}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {b64(os.urandom(16))}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Protocol: {SUBPROTO}\r\n"
+            f"Origin: {ORIGIN}\r\nCookie: {ck}\r\n\r\n".encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            part = raw.recv(4096)
+            self.assertTrue(part)
+            head += part
+        self.assertIn(b"101", head.split(b"\r\n")[0])
+        mask = os.urandom(4)
+        body = json.dumps(
+            {"v": 1, "kind": "command", "request_id": "sil1",
+             "client_id": None, "generation": 0, "csrf": None,
+             "op": "attach",
+             "body": {"tab_id": "tab-silent", "release_id": RELEASE,
+                      "cursor_hint": None}}).encode()
+        frame = bytes([0x81, 0x80 | 126]) + struct.pack(
+            "!H", len(body)) + mask + bytes(
+            c ^ mask[i % 4] for i, c in enumerate(body))
+        raw.sendall(frame)
+        raw.settimeout(1.0)
+        # never answer pings; the server must close us with 1008
+        code = None
+        end = time.time() + 10
+        buf = b""
+        try:
+            while time.time() < end and code is None:
+                try:
+                    part = raw.recv(4096)
+                except socket.timeout:
+                    continue
+                if not part:
+                    break
+                buf += part
+                while len(buf) >= 2:
+                    b1, b2 = buf[0], buf[1]
+                    op = b1 & 0x0F
+                    ln = b2 & 0x7F
+                    idx = 2
+                    if ln == 126:
+                        if len(buf) < 4:
+                            break
+                        ln = struct.unpack("!H", buf[2:4])[0]
+                        idx = 4
+                    if len(buf) < idx + ln:
+                        break
+                    pay = buf[idx:idx + ln]
+                    buf = buf[idx + ln:]
+                    if op == 0x8:
+                        code = struct.unpack("!H", pay[:2])[0] \
+                            if len(pay) >= 2 else None
+        finally:
+            raw.close()
+        self.assertEqual(code, 1008)
+
 
 class T_S023_ReleaseResync(ServingBase):
     def test_s023_release_resync(self):
@@ -1513,7 +1832,7 @@ class T_S024_StaticMounts(unittest.TestCase):
                                  name)))
 
 
-class T_S025_SandboxBridge(unittest.TestCase):
+class T_S025_SandboxBridge(ServingBase):
     def test_s025_sandbox_bridge(self):
         with open(os.path.join(adaptermod.STATIC_DIR,
                                "index.html")) as f:
@@ -1525,9 +1844,73 @@ class T_S025_SandboxBridge(unittest.TestCase):
         self.assertEqual(FRAME_ID, "frag-frame")
         with open(os.path.join(adaptermod.STATIC_DIR, "app.js")) as f:
             js = f.read()
-        for op in ("render", "action", "resize", "ready",
-                   "form-state"):
+        for op in ("render", "action-click", "resize", "ready",
+                   "form-state", "init"):
             self.assertIn(op, js)
+        # token/context fence is behavioral, not a string check:
+        # unit-level bridge validation first
+        from p0contract.render_policy import validate_bridge
+        ok, _ = validate_bridge(
+            {"source_ok": True, "token": "tok", "op": "action",
+             "context": "ctx", "payload": {"action_id": "a.ok"}},
+            "tok", "ctx", ("a.ok",))
+        self.assertTrue(ok)
+        for bad in ({"source_ok": False, "token": "tok",
+                     "op": "action", "context": "ctx",
+                     "payload": {"action_id": "a.ok"}},
+                    {"source_ok": True, "token": "stale",
+                     "op": "action", "context": "ctx",
+                     "payload": {"action_id": "a.ok"}},
+                    {"source_ok": True, "token": "tok",
+                     "op": "action", "context": "other",
+                     "payload": {"action_id": "a.ok"}},
+                    {"source_ok": True, "token": "tok",
+                     "op": "action", "context": "ctx",
+                     "payload": {"action_id": "a.evil"}}):
+            ok, _ = validate_bridge(bad, "tok", "ctx", ("a.ok",))
+            self.assertFalse(ok)
+
+    def test_s025_frame_token_fence(self):
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        self.assertIsNotNone(w)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        good = w["body"]["frame_token"]
+        self.assertTrue(good)
+        base = {"v": 1, "kind": "command",
+                "client_id": w["client_id"],
+                "generation": w["generation"],
+                "csrf": w["body"]["csrf"],
+                "op": "action.invoke",
+                "body": {"conversation_id": conv,
+                       "action_id": "a.evil",
+                       "values": {}, "context_id": w["client_id"],
+                       "expected_revision": 0, "confirm": False}}
+        # tokenless frame action is rejected before domain effects
+        bad = dict(base, request_id="f1")
+        ws.send(bad)
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rej["body"]["code"], "bad-frame-token")
+        # stale token likewise, even with a live session + CSRF
+        stale = dict(base, request_id="f2")
+        stale["body"] = dict(base["body"],
+                             frame_token="stale-token")
+        ws.send(stale)
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rej["body"]["code"], "bad-frame-token")
+        # live token passes the fence; the unregistered action is denied
+        # by domain registration, never executed
+        live = dict(base, request_id="f3")
+        live["body"] = dict(base["body"],
+                            frame_token=good)
+        ws.send(live)
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rej["body"]["code"],
+                         "unknown-action")
 
 
 class T_S026_NoPageNetwork(unittest.TestCase):
@@ -1632,26 +2015,77 @@ class T_S028_RuntimeConfig(ServingBase):
         code, _ = ws.wait_close(timeout=10) or (None, None)
         self.assertEqual(code, 1009)
 
+    def test_s028_nondefault_policy_honored(self):
+        # Non-default runtime knobs change behavior: welcome carries
+        # them, the pong deadline enforces them, the busy timeout is set.
+        self.start_stack(settings_over={
+            "adapter": {"draft_bytes": 12345,
+                        "reconnect_base_seconds": 7,
+                        "reconnect_factor": 3,
+                        "reconnect_cap_seconds": 77,
+                        "reconnect_stable_seconds": 88,
+                        "frame_min_height": 50,
+                        "frame_max_height": 500,
+                        "ws_ping_seconds": 1,
+                        "ws_pong_timeout_seconds": 1,
+                        "sqlite_busy_seconds": 5}})
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        pol = w["body"]["client_policy"]
+        self.assertEqual(pol["draft_bytes"], 12345)
+        self.assertEqual(pol["reconnect_base_seconds"], 7)
+        self.assertEqual(pol["reconnect_factor"], 3)
+        self.assertEqual(pol["reconnect_cap_seconds"], 77)
+        self.assertEqual(pol["reconnect_stable_seconds"], 88)
+        self.assertEqual(pol["frame_min_height"], 50)
+        self.assertEqual(pol["frame_max_height"], 500)
+        row = self.srv.authdb.db.execute(
+            "PRAGMA busy_timeout").fetchone()
+        self.assertEqual(row[0], 5000)
+        # JS owns no numeric policy of its own
+        with open(os.path.join(adaptermod.STATIC_DIR, "app.js")) as f:
+            js = f.read()
+        for lit in ("65536", "30000", "800", "80"):
+            self.assertNotIn(lit, js)
+
 
 class T_S029_FrameFocus(unittest.TestCase):
     def test_s029_frame_focus_size(self):
         with open(os.path.join(adaptermod.STATIC_DIR, "app.js")) as f:
             js = f.read()
         self.assertIn("action.invoke", js)
-        self.assertIn("Math.min(800", js)
-        self.assertIn("Math.max(80", js)
+        self.assertIn("frame_token", js)
+        # clamp and queue bounds come from welcome policy, not literals
+        self.assertNotIn("Math.min(800", js)
+        self.assertNotIn("Math.max(80", js)
         # patches touch bubble articles only; composer node is stable
         self.assertIn('getElementById("composer")', js)
         self.assertNotIn("composer.replaceWith", js)
         self.assertNotIn("bubbles.replaceChildren", js.replace(
             "bubblesEl.replaceChildren", ""))
+        # frame init handshake (sentinel bundle + per-session init)
+        self.assertIn('op: "init"', js)
+        from p2rich.sandbox import FRAME_JS
+        self.assertIn("INITED", FRAME_JS)
         # real browser: bridge ops, focus, sizing
         rep, _st = live_report()
-        for name in ("exactly one reusable iframe",
+        for name in ("assistant DOM bubble renders nonce answer",
+                     "exactly one reusable iframe",
                      "frame sandbox exactly allow-scripts",
-                     "bogus frame op ignored",
+                     "frame srcdoc mounted",
+                     "frame render delivers nonce answer",
+                     "tokenless frame action ignored",
                      "frame action forwarded through domain validation",
-                     "frame resize clamped to configured max"):
+                     "frame resize clamped to configured max",
+                     "reconnect after reload mid-send",
+                     "reload mid-send: answer arrives exactly once",
+                     "socket drop reconnects with fresh welcome",
+                     "backoff recovery returns to ready",
+                     "wrong-origin upgrade rejected",
+                     "untrusted frame script blocked by CSP",
+                     "drawer list stable across reload"):
             self.assertEqual(rep["checks"].get(name), "pass",
                              "%s :: %s" % (name, rep["checks"].get(
                                  name)))

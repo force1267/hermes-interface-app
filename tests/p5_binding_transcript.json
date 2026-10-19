@@ -1,9 +1,9 @@
 {
   "release": "p5-P0",
   "adapter_generation": 1,
-  "conversation_id": "conv-c-b662c9201fe8ecb7",
-  "prompt": "In exactly one short sentence, use the word quasar-waffle-p5-283a11 to describe a working websocket bridge.",
-  "payload_hash": "2b384b42bcecf097e4a4026bfcc95f0fb2ee53df49bd1bcdca3f83cfc490d55a",
+  "conversation_id": "conv-c-890a28acbbefd253",
+  "prompt": "In exactly one short sentence, use the word quasar-waffle-p5-b500b1 to describe a working websocket bridge.",
+  "payload_hash": "eb2f49e58a5959de323461ea3ee686d39a5aae4a13a0e973a5d0b53828d08524",
   "cli": [
     "/root/.local/bin/hermes",
     "chat",
@@ -16,24 +16,36 @@
     "--source",
     "interface-app"
   ],
-  "hermes_session_id": "20261019_002607_b4e1b8",
+  "hermes_session_id": "20261019_022945_90b85f",
   "terminal_exit": 0,
-  "terminal_text": "The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops.",
-  "assistant_message_id": "m-r-205efb704d32f6ad-a",
+  "terminal_text": "The quasar-waffle-p5-b500b1 websocket bridge relays live messages both ways without drops.",
+  "assistant_message_id": "m-r-e9faf408e212ab64-a",
   "ws_outcome": {
     "code": "ok",
-    "cursor": "m-r-205efb704d32f6ad-a",
-    "message_id": "m-r-205efb704d32f6ad-a",
+    "cursor": "m-r-e9faf408e212ab64-a",
+    "message_id": "m-r-e9faf408e212ab64-a",
     "status": "completed"
   },
   "rendered_bubble": {
-    "frame_payload": null,
-    "id": "m-r-205efb704d32f6ad-a",
+    "frame_payload": {
+      "fragment_id": "f-r-e9faf408e212ab64",
+      "kind": "text",
+      "preview": true,
+      "tree": {
+        "children": [],
+        "component": "Text",
+        "props": {
+          "text": "The quasar-waffle-p5-b500b1 websocket bridge relays live messages both ways without drops."
+        }
+      }
+    },
+    "id": "m-r-e9faf408e212ab64-a",
     "major": 1,
-    "preview_html": "<article class=\"bubble gen std preview\" data-fragment=\"f-r-205efb704d32f6ad\" data-kind=\"text\" data-origin=\"generated\" data-mode=\"standard\" data-preview=\"truncated\" style=\"max-height:160px;max-width:360px;overflow:hidden\"><span class=\"gen-badge\">Generated</span><p class=\"t\">The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops.</p><button class=\"x\" data-op=\"expand\">Expand</button></article>",
+    "mode": "standard",
+    "preview_html": "<article class=\"bubble gen std preview\" data-fragment=\"f-r-e9faf408e212ab64\" data-kind=\"text\" data-origin=\"generated\" data-mode=\"standard\" data-preview=\"truncated\" style=\"max-height:160px;max-width:360px;overflow:hidden\"><span class=\"gen-badge\">Generated</span><p class=\"t\">The quasar-waffle-p5-b500b1 websocket bridge relays live messages both ways without drops.</p><button class=\"x\" data-op=\"expand\">Expand</button></article>",
     "revision": 1,
     "role": "assistant",
-    "text": "The quasar-waffle-p5-283a11 bridge forwards live messages both ways without drops."
+    "text": "The quasar-waffle-p5-b500b1 websocket bridge relays live messages both ways without drops."
   },
   "launch_count": 1,
   "restart_lookup_without_relaunch": true

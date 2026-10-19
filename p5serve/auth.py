@@ -50,10 +50,14 @@ CREATE TABLE IF NOT EXISTS clients(
 """
 
 
-def sqlite(db_path):
+def sqlite(db_path, busy_seconds=2):
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     db = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
     db.execute("PRAGMA journal_mode=WAL")
+    try:
+        db.execute("PRAGMA busy_timeout=%d" % (int(busy_seconds) * 1000))
+    except (ValueError, sqlite3.Error):
+        pass
     db.executescript(SCHEMA)
     db.commit()
     try:
@@ -87,7 +91,8 @@ class AuthStore:
         a = cfg["auth"]
         self.cookie_name = a["cookie_name"]
         self.pre_name = a["preauth_cookie_name"]
-        self.db = sqlite(cfg["adapter"]["state_db"])
+        self.db = sqlite(cfg["adapter"]["state_db"],
+                         busy_seconds=cfg["adapter"]["sqlite_busy_seconds"])
         self.lock = __import__("threading").Lock()
 
     # -- provisioning --

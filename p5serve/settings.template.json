@@ -20,6 +20,7 @@
     "outbound_bytes": 2097152,
     "queue_safety_messages": 64,
     "queue_safety_bytes": 2097152,
+    "retry_after_seconds": 60,
     "ws_ping_seconds": 20,
     "ws_pong_timeout_seconds": 10,
     "session_check_seconds": 1,

@@ -202,6 +202,16 @@ FRAME_JS = r"""
   }
   var FORMS = {};
   var CURRENT = null;
+  var INITED = false;
+  function setInited(tok, ctx, acts){
+    if (typeof tok !== "string" || !tok) return false;
+    if (typeof ctx !== "string" || !ctx) return false;
+    TOKEN = tok; CONTEXT = ctx;
+    if (Object.prototype.toString.call(acts) === "[object Array]")
+      REGISTERED = acts.filter(function(a){ return typeof a === "string"; });
+    INITED = true;
+    return true;
+  }
   document.addEventListener("input", function(ev){
     var t = ev.target;
     if(!t||!t.name||!CURRENT) return;
@@ -260,6 +270,11 @@ FRAME_JS = r"""
   window.addEventListener("message", function(ev){
     if(ev.source!==window.parent){ reply("denied"); return; }
     var d = ev.data||{};
+    if(d.op==="init"){
+      reply(setInited(d.token, d.context, d.actions)?"ok":"denied");
+      return;
+    }
+    if(!INITED){ reply("denied"); return; }
     var ok = d.token===TOKEN && d.context===CONTEXT &&
       (d.op==="render"||d.op==="action"||d.op==="resize"||d.op==="ready");
     if(!ok){ reply("denied"); return; }
@@ -295,14 +310,50 @@ FRAME_JS = r"""
 """
 
 
+_SENTINEL_TOKEN = "__TOKEN__"
+_SENTINEL_CONTEXT = "__CONTEXT__"
+
+
 def _frame_js(channel_token, context, registered_actions=()):
-    return (FRAME_JS.replace("__TOKEN__", channel_token)
+    js = (FRAME_JS.replace("__TOKEN__", channel_token)
             .replace("__CONTEXT__", context)
             .replace("__ACTIONS__", json.dumps(list(registered_actions))))
+    if channel_token != _SENTINEL_TOKEN:
+        # Baked-credential bundle: live from load, no init op needed.
+        # Sentinel bundles keep INITED=false until the init op arrives
+        # (see serving_frame_js).
+        js = js.replace("var INITED = false;", "var INITED = true;", 1)
+    return js
 
 
 def _sha256_b64(text):
     return base64.b64encode(hashlib.sha256(text.encode()).digest()).decode()
+
+
+def serving_frame_js():
+    """Static frame bundle for the served shell: sentinel token/context.
+
+    Identical bytes for every session, so the parent page CSP can pin its
+    hash. The live channel token/context/actions arrive via the postMessage
+    init op (see FRAME_JS setInited); baked-token bundles from frame_srcdoc
+    keep working unchanged.
+    """
+    return _frame_js(_SENTINEL_TOKEN, _SENTINEL_CONTEXT, [])
+
+
+def serving_frame_srcdoc():
+    """Full static srcdoc document embedding serving_frame_js().
+
+    The meta CSP pins the exact bundle hash; the parent inlines this doc
+    and delivers per-session credentials with init.
+    """
+    js = serving_frame_js()
+    digest_b64 = _sha256_b64(js)
+    csp = (CSP_BASE + "; " + CSP_NAV +
+           f"; script-src 'sha256-{digest_b64}'")
+    return ("""<!doctype html><html><head><meta http-equiv="Content-Security-Policy" """
+            f"""content="{csp}"></head>"""
+            f"""<body><div id="r"></div><script>{js}</script></body></html>""")
 
 
 def frame_srcdoc(channel_token, context, registered_actions=()):

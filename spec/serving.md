@@ -125,6 +125,7 @@ Implementation ships a settings template loaded at startup. Missing/invalid requ
         "write_timeout_seconds":10, "sqlite_busy_seconds":2,
         "outbound_messages":64, "outbound_bytes":2097152,
         "queue_safety_messages":64, "queue_safety_bytes":2097152,
+        "retry_after_seconds":60,
         "ws_ping_seconds":20, "ws_pong_timeout_seconds":10,
         "session_check_seconds":1, "credential_check_seconds":1,
         "reconnect_base_seconds":1, "reconnect_factor":2,

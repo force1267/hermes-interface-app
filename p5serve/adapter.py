@@ -26,17 +26,27 @@ import base64
 import hashlib
 import json
 import os
+import secrets as _secrets
 import socket
+import sqlite3 as _sqlite3
 import struct
 import threading
 import time
 
 from p0contract import messages, wire
+from p0contract import render_policy as render_policy_mod
 from p1transport import Client, ConnectionLost
 from p1transport import protocol
+from p2rich.renderer import PREVIEW_MAX_TEXT_CHARS
+from p3drawer import drawer as drawer_mod
+from p3drawer import ops as drawer_ops
 
 from . import auth as authmod
 from . import config as configmod
+
+
+class StoreError(Exception):
+    """Durable-store failure: callers must fail closed, never proceed."""
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 SUBPROTOCOL = "hermes.web.v1"
@@ -70,6 +80,9 @@ class AdapterServer:
         self.host = a["host"]
         self.path = a["path"]
         self.authdb = authmod.AuthStore(self.cfg)
+        self._drawer_db = self._open_db()
+        drawer_mod.ensure_tables(self._drawer_db)
+        self.drawer = drawer_mod.Drawer(self._drawer_db)
         self.policy = {"revision": None, "expires_at": 0,
                        "queue_max_messages": None,
                        "queue_max_bytes": None,
@@ -100,6 +113,35 @@ class AdapterServer:
         self.shell_doc = self._build_shell()
         threading.Thread(target=self._expiry_loop, daemon=True).start()
 
+    def _open_db(self):
+        """Service-owned handle on the state db honoring sqlite_busy_seconds."""
+        db = _sqlite3.connect(self.cfg["adapter"]["state_db"],
+                              check_same_thread=False, timeout=10)
+        db.execute("PRAGMA journal_mode=WAL")
+        try:
+            ms = int(self.cfg["adapter"]["sqlite_busy_seconds"]) * 1000
+            db.execute("PRAGMA busy_timeout=%d" % ms)
+        except (ValueError, _sqlite3.Error):
+            pass
+        return db
+
+    def client_policy(self):
+        """Runtime knobs the browser must obey (R4); no JS-owned literals."""
+        a = self.cfg["adapter"]
+        return {
+            "draft_bytes": a["draft_bytes"],
+            "reconnect_base_seconds": a["reconnect_base_seconds"],
+            "reconnect_factor": a["reconnect_factor"],
+            "reconnect_cap_seconds": a["reconnect_cap_seconds"],
+            "reconnect_stable_seconds": a["reconnect_stable_seconds"],
+            "frame_min_height": a["frame_min_height"],
+            "frame_max_height": a["frame_max_height"],
+            "frame_ready_timeout_seconds": a[
+                "frame_ready_timeout_seconds"],
+            "outbound_messages": a["outbound_messages"],
+            "outbound_bytes": a["outbound_bytes"],
+        }
+
     def _build_shell(self):
         """Assemble the served document: release-owned chrome with the
         transport shim and styles inlined so the pinned-hash CSP covers
@@ -118,6 +160,10 @@ class AdapterServer:
         doc = doc.replace(b"/*__APP_JS__*/", app_js)
         doc = doc.replace(b"/*__STYLE_CSS__*/", css)
         doc = doc.replace(b"__RELEASE_ID__", self.release.encode())
+        from p2rich.sandbox import serving_frame_srcdoc as _frame_doc
+        frame_json = json.dumps(_frame_doc()).replace(
+            "</script", "<\\/script").replace("<", "\\u003c").encode()
+        doc = doc.replace(b"__FRAME_DOC_JSON__", frame_json)
         return doc
 
     # -- lifecycle --
@@ -127,7 +173,7 @@ class AdapterServer:
         self._lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._lsock.bind(self.bind)
-        self._lsock.listen(32)
+        self._lsock.listen(self.cfg["adapter"]["max_connections"])
         self._serve = self._lsock
         threading.Thread(target=self._accept_loop, daemon=True).start()
         return self._lsock.getsockname()[1]
@@ -284,7 +330,8 @@ class AdapterServer:
 
     def _csp_header(self):
         import hashlib as _hl
-        frame_raw = _hl.sha256(frame_bundle_js().encode()).digest()
+        from p2rich.sandbox import serving_frame_js as _serving_js
+        frame_raw = _hl.sha256(_serving_js().encode()).digest()
         frame_b64 = base64.b64encode(frame_raw).decode()
         pins = " ".join(
             "'sha256-" + h + "'" for h in
@@ -298,8 +345,8 @@ class AdapterServer:
         return ("Content-Security-Policy: default-src 'none'; "
                 "connect-src " + connect + "; "
                 "object-src 'none'; base-uri 'none'; form-action 'self'; "
-                "frame-ancestors 'none'; script-src " + pins +
-                "; style-src " + pins)
+                "frame-src 'self'; frame-ancestors 'none'; script-src " +
+                pins + "; style-src " + pins)
 
     # -- native auth on the same path --
     def _http_auth_page(self, conn, headers):
@@ -351,7 +398,8 @@ class AdapterServer:
             if not ok:
                 if err == "rate-limited":
                     self._http(conn, 429, "too many attempts",
-                               {"Retry-After": "60"})
+                               {"Retry-After": str(self.cfg["adapter"][
+                                   "retry_after_seconds"])})
                 else:
                     self._http(conn, 401, "bad credentials", {})
                 return
@@ -381,6 +429,25 @@ class AdapterServer:
                 c.close(1008, "logged-out")
             except OSError:
                 pass
+
+    def broadcast_client(self, rec_id, op, body, request_id=None):
+        """Deliver to every live socket holding this logical client.
+
+        Lets a completion land on the post-reload generation, not just
+        the socket that sent the command. Each socket keeps its own
+        event numbering; closed sockets are skipped, never resurrected.
+        """
+        with self.sockets_lock:
+            conns = [c for lst in self.sockets.values() for c in lst
+                     if c.client_id == rec_id and not c.closed]
+        sent = False
+        for c in conns:
+            try:
+                if c.send_event(op, body, request_id):
+                    sent = True
+            except Exception:
+                pass
+        return sent
 
     # -- websocket --
     def _handle_ws(self, conn, rfile, method, target, headers):
@@ -500,7 +567,9 @@ class AdapterServer:
 
     def _load_clients(self):
         try:
-            db = authmod.sqlite(self.cfg["adapter"]["state_db"])
+            db = authmod.sqlite(
+                self.cfg["adapter"]["state_db"],
+                busy_seconds=self.cfg["adapter"]["sqlite_busy_seconds"])
             rows = db.execute("SELECT client_id, record FROM clients"
                               ).fetchall()
             for cid, rec in rows:
@@ -512,17 +581,22 @@ class AdapterServer:
     def _save_client(self, cid, rec):
         self.clients[cid] = rec
         try:
-            db = authmod.sqlite(self.cfg["adapter"]["state_db"])
+            db = authmod.sqlite(
+                self.cfg["adapter"]["state_db"],
+                busy_seconds=self.cfg["adapter"]["sqlite_busy_seconds"])
             db.execute("INSERT OR REPLACE INTO clients(client_id,"
                        " record) VALUES(?,?)", (cid, json.dumps(rec)))
             db.commit()
             db.close()
-        except Exception:
-            pass
+        except Exception as e:
+            raise StoreError(f"store-unavailable: {e}")
 
     def _expiry_loop(self):
         while not self._closed:
-            time.sleep(self.cfg["adapter"]["session_check_seconds"])
+            period = self.cfg["adapter"]["session_check_seconds"]
+            cred = self.cfg["adapter"]["credential_check_seconds"]
+            delay = min(period, cred) or 1
+            time.sleep(delay)
             try:
                 dead = self.authdb.expire_sweep()
             except Exception:
@@ -549,8 +623,9 @@ class WSConn:
         self.generation = 0
         self.csrf = None
         self.event_seq = 0
-        self.out_bytes = 0
-        self.out_msgs = 0
+        self.unacked = []  # [(event_seq, bytes)] not yet receipted
+        self.last_pong = time.time()
+        self.ping_sent = None  # time of the last ping needing a pong
         self.closed = False
         self.wlock = threading.Lock()
         self.frag = None  # fragmented text buffer
@@ -573,8 +648,12 @@ class WSConn:
         payload = json.dumps(obj, sort_keys=True).encode("utf-8")
         if len(payload) > self.a["frame_bytes"]:
             return False
-        if self.out_msgs + 1 > self.a["outbound_messages"] or \
-                self.out_bytes + len(payload) > self.a["outbound_bytes"]:
+        # Outstanding (unreceipted) backpressure: a healthy reader that
+        # receipts stays alive indefinitely; a silent consumer is fenced
+        # with 1013 and recovers from durable history via explicit resync.
+        pending = sum(size for _, size in self.unacked)
+        if len(self.unacked) + 1 > self.a["outbound_messages"] or \
+                pending + len(payload) > self.a["outbound_bytes"]:
             self.close(1013, "backpressure")
             return False
         frame = b"\x81" + _encode_len(len(payload)) + payload
@@ -583,8 +662,7 @@ class WSConn:
                 self.conn.sendall(frame)
             except OSError:
                 return False
-        self.out_msgs += 1
-        self.out_bytes += len(payload)
+        self.unacked.append((self.event_seq, len(payload)))
         return True
 
     def send_event(self, op, body, request_id=None):
@@ -612,11 +690,19 @@ class WSConn:
     def _ping_tick(self):
         if self.closed:
             return
+        now = time.time()
+        if self.ping_sent is not None and \
+                self.last_pong < self.ping_sent and \
+                now - self.ping_sent > \
+                self.a["ws_pong_timeout_seconds"]:
+            self.close(1008, "pong-timeout")
+            return
         with self.wlock:
             try:
                 self.conn.sendall(b"\x89\x00")
             except OSError:
                 return
+        self.ping_sent = now
         threading.Timer(self.a["ws_ping_seconds"],
                         self._ping_tick).start()
 
@@ -625,7 +711,20 @@ class WSConn:
             while not self.closed:
                 opcode, payload = self._read_frame()
                 if opcode == 0x8:
+                    # RFC6455 close echo: answer the peer's close so
+                    # its onclose (and our reconnect) fires promptly.
+                    with self.wlock:
+                        try:
+                            self.conn.sendall(
+                                b"\x88" + _encode_len(len(payload))
+                                + payload)
+                        except OSError:
+                            pass
                     self.closed = True
+                    try:
+                        self.conn.close()
+                    except OSError:
+                        pass
                     return
                 if opcode == 0x9:
                     with self.wlock:
@@ -636,6 +735,7 @@ class WSConn:
                             return
                     continue
                 if opcode == 0xA:
+                    self.last_pong = time.time()
                     continue
                 if opcode == 0x2:
                     self.close(1003, "binary-not-supported")
@@ -705,6 +805,7 @@ class WSConn:
                         raise ConnectionLost("peer closed")
                 continue
             if opcode == 0xA:
+                self.last_pong = time.time()
                 continue
             if opcode == 0x8:
                 if payload:
@@ -781,8 +882,12 @@ class WSConn:
             self._outcome(msg["request_id"], "rejected",
                           "bad-generation", None)
             return
-        ok, sess = self.srv.authdb.check_session_by_hash(
-            self.sess["token_hash"])
+        try:
+            ok, sess = self.srv.authdb.check_session_by_hash(
+                self.sess["token_hash"])
+        except Exception:
+            self.close(1011, "store-unavailable")
+            return
         if not ok:
             self.close(1008, "expired")
             return
@@ -834,7 +939,11 @@ class WSConn:
     def _do_attach(self, msg):
         a = self.srv.authdb
         body = msg["body"]
-        ok, sess = a.check_session_by_hash(self.sess["token_hash"])
+        try:
+            ok, sess = a.check_session_by_hash(self.sess["token_hash"])
+        except Exception:
+            self.close(1011, "store-unavailable")
+            return
         if not ok:
             self.close(1008, "expired")
             return
@@ -874,46 +983,111 @@ class WSConn:
                    "budget_revision": None, "updated_at": int(time.time())}
         rec["generation"] = int(rec.get("generation", 0)) + 1
         rec["updated_at"] = int(time.time())
-        self.srv._save_client(rec_id, rec)
+        rec["frame_token"] = _secrets.token_hex(16)
+        rec["frame_context"] = "ctx-%s-%d" % (rec_id,
+                                              rec["generation"])
+        try:
+            self.srv._save_client(rec_id, rec)
+        except StoreError:
+            self.close(1011, "store-unavailable")
+            return
         self.client_id = rec_id
         self.generation = rec["generation"]
-        self.csrf = a.rotate_ws_token(sess["token_hash"])
+        try:
+            self.csrf = a.rotate_ws_token(sess["token_hash"])
+        except Exception:
+            self.close(1011, "store-unavailable")
+            return
         self.send_event("welcome",
                         {"csrf": self.csrf,
                          "release_id": self.srv.release,
-                         "protocol": SUBPROTOCOL, "state": "resuming"},
+                         "protocol": SUBPROTOCOL, "state": "resuming",
+                         "client_policy": self.srv.client_policy(),
+                         "frame_token": rec["frame_token"],
+                         "frame_context": rec["frame_context"],
+                         "registered_actions": []},
                         msg["request_id"])
-        self._push_snapshot(msg["request_id"], resync=True)
+        try:
+            self._push_snapshot(msg["request_id"], resync=True)
+        except StoreError:
+            self.close(1011, "store-unavailable")
+
+    def _drawer_projection(self):
+        """Real drawer read: entries + honest Add framing from backend state."""
+        try:
+            res = drawer_ops.handle_op(self.srv.drawer, {"op": "list"})
+        except Exception:
+            return {"items": [],
+                    "add": {"affordance": "add-page", "enabled": False}}
+        entries = res.get("entries", []) if isinstance(res, dict) else []
+        items = [{"id": e.get("page_id"), "label": e.get("name"),
+                  "pinned": bool(e.get("pinned")),
+                  "state": e.get("status")}
+                 for e in entries if isinstance(e, dict)]
+        add = dict(res.get("add", {})) if isinstance(res, dict) else {}
+        add["enabled"] = bool(
+            self.srv.cfg["provider"]["drawer_writes_enabled"])
+        if not add["enabled"]:
+            add["detail"] = "not enabled yet"
+        return {"items": items, "add": add}
 
     def _push_snapshot(self, request_id, resync=False):
-        bubbles, conv = self._domain_snapshot()
+        bubbles, conv, alive = self._domain_snapshot()
+        drawer = self._drawer_projection()
         self.send_event("snapshot",
                         {"conversation_id": conv,
                          "revision": len(bubbles),
                          "cursor": self.srv.up_cursor,
-                         "bubbles": bubbles, "drawer": {"items": []},
+                         "bubbles": bubbles, "drawer": drawer,
                          "pending": [p for p in
                                      self.srv.pending.values() if
                                      p.get("client_id")
                                      == self.client_id]},
                         request_id)
+        if not alive:
+            # Verified cached history only, explicitly marked stale.
+            self.send_event("status",
+                            {"state": "backend-unavailable",
+                             "detail": "backend unreachable"},
+                            request_id)
+
+    def _known_bubble_ids(self):
+        rec = self.srv.clients.get(self.client_id, {})
+        ids = {b.get("id") for b in rec.get("assistant", [])
+               if isinstance(b, dict) and b.get("id")}
+        for b in self.srv.up_last_seen:
+            if isinstance(b, dict) and b.get("id"):
+                ids.add(b["id"])
+        return ids
 
     def _domain_snapshot(self):
         conv = (self.srv.clients.get(self.client_id, {})
                 .get("conversation_id", "conv-none"))
         rec = self.srv.clients.get(self.client_id, {})
+        modes = rec.get("view_modes", {}) if isinstance(
+            rec.get("view_modes"), dict) else {}
         try:
             up = self.srv.upstream()
             sess = up.session or {}
             bubbles = [{"id": b["id"], "revision": b["revision"],
                         "major": b["major"], "text": b["text"],
                         "preview_html": None, "frame_payload": None,
-                        "role": "user"} for b in up.bubbles]
+                        "role": "user",
+                        "mode": modes.get(b["id"], "standard")}
+                       for b in up.bubbles]
+            alive = True
         except (ConnectionLost, OSError, ValueError):
             self.srv.upstream_drop()
+            alive = False
             bubbles = []
-        bubbles = bubbles + rec.get("assistant", [])
-        return bubbles, conv
+        assist = []
+        for b in rec.get("assistant", []):
+            b = dict(b)
+            b["mode"] = modes.get(b.get("id"), b.get("mode",
+                                                     "standard"))
+            assist.append(b)
+        bubbles = bubbles + assist
+        return bubbles, conv, alive
 
     def _do_snapshot(self, msg):
         try:
@@ -1008,7 +1182,12 @@ class WSConn:
             env = protocol.mk_text_envelope(
                 "ws-" + request_id, 0, payload.encode("utf-8"))
             reply = self._upstream_roundtrip(up, env, payload)
-            self._record_upstream_state(up)
+            try:
+                self._record_upstream_state(up)
+            except Exception:
+                self._finish(ws_req, request_id, cid,
+                             "outcome-unknown", "unknown", None)
+                return
             term_text = self._result_text(reply)
             if term_text is None:
                 self._finish(ws_req, request_id, cid,
@@ -1024,8 +1203,12 @@ class WSConn:
                     up.cursor = reply["cursor"]
                 except AttributeError:
                     pass
-            self._render_and_patch(ws_req, request_id, cid, text,
-                                   term_text)
+            try:
+                self._render_and_patch(ws_req, request_id, cid, text,
+                                       term_text)
+            except StoreError:
+                self._finish(ws_req, request_id, cid,
+                             "outcome-unknown", "unknown", None)
         except (ConnectionLost, OSError, ValueError):
             self.srv.upstream_drop()
             self._finish(ws_req, request_id, cid, "outcome-unknown",
@@ -1100,7 +1283,7 @@ class WSConn:
                                      fallback_bubble_html)
         frag = {"kind": "text", "origin": "generated",
                 "fragment_id": "f-" + request_id,
-                "fallback_text": term_text[:200],
+                "fallback_text": term_text[:PREVIEW_MAX_TEXT_CHARS],
                 "tree": {"component": "Text", "props": {"text": term_text},
                          "children": []},
                 "version": {"major": 1, "minor": 0}}
@@ -1108,19 +1291,37 @@ class WSConn:
             preview = render_preview_html(frag)
         except Exception:
             preview = fallback_bubble_html(term_text, "render-failed")
-        bubble = {"id": "m-" + request_id + "-a", "revision": 1,
-                  "major": 1, "text": term_text,
-                  "preview_html": preview, "frame_payload": None,
-                  "role": "assistant"}
         rec = self.srv.clients.get(self.client_id, {})
         assist = rec.get("assistant", [])
+        modes = rec.get("view_modes", {}) if isinstance(
+            rec.get("view_modes"), dict) else {}
+        bubble = {"id": "m-" + request_id + "-a",
+                  "revision": len(assist) + 1,
+                  "major": 1, "text": term_text,
+                  "preview_html": preview,
+                  "frame_payload": {
+                      "fragment_id": frag["fragment_id"],
+                      "kind": "text", "tree": frag["tree"],
+                      "preview": True},
+                  "role": "assistant",
+                  "mode": modes.get("m-" + request_id + "-a",
+                                    "standard")}
         assist.append(bubble)
         cap = self.a["outbound_messages"]
         rec["assistant"] = assist[-cap:] if cap > 0 else assist
+        # Durable history BEFORE projecting completed: a store failure
+        # leaves outcome-unknown, never a completed projection.
         self.srv._save_client(self.client_id, rec)
-        self.send_event("patch",
-                        {"region": "bubbles", "revision": 1,
-                         "items": [bubble]}, ws_req)
+        if self.client_id is not None:
+            self.srv.broadcast_client(
+                self.client_id,
+                "patch",
+                {"region": "bubbles", "revision": 1,
+                 "items": [bubble]}, ws_req)
+        else:
+            self.send_event("patch",
+                            {"region": "bubbles", "revision": 1,
+                             "items": [bubble]}, ws_req)
         self._finish(ws_req, request_id, cid, "completed", "ok",
                      bubble["id"])
 
@@ -1129,29 +1330,108 @@ class WSConn:
         pend = self.srv.pending.get(request_id)
         if pend is not None:
             pend["state"] = status
-        self._outcome(ws_req, status, code, message_id,
-                      cursor=message_id)
+        body = {"status": status, "code": code,
+                "message_id": message_id, "cursor": message_id}
+        if self.client_id is None:
+            self._outcome(ws_req, status, code, message_id,
+                          cursor=message_id)
+            return
+        # Broadcast: a reload may have moved this logical client to a
+        # new generation; the completion must reach the live socket.
+        self.srv.broadcast_client(self.client_id, "outcome", body,
+                                  ws_req)
 
     def _do_action(self, msg):
+        body = msg["body"]
+        cid = body.get("conversation_id")
+        own = self.srv.clients.get(self.client_id, {})
+        if not isinstance(cid, str) or not cid or \
+                cid != own.get("conversation_id") or \
+                not isinstance(body.get("action_id"), str) or \
+                not body.get("action_id") or \
+                not isinstance(body.get("values", {}), dict) or \
+                not isinstance(body.get("expected_revision"), int) or \
+                isinstance(body.get("expected_revision"), bool) or \
+                not isinstance(body.get("confirm", False), bool):
+            self._outcome(msg["request_id"], "rejected",
+                          "bad-payload", None)
+            return
+        rec = self.srv.clients.get(self.client_id, {})
+        event = {"source_ok": True, "token": body.get("frame_token"),
+                 "op": "action", "context": rec.get("frame_context"),
+                 "payload": {"action_id": body.get("action_id")}}
+        ok, reason = render_policy_mod.validate_bridge(
+            event, rec.get("frame_token"), rec.get("frame_context"), ())
+        if not ok:
+            if reason in ("bridge-source-denied",
+                          "bridge-token-denied",
+                          "bridge-context-denied"):
+                code = "bad-frame-token"
+            else:
+                code = "unknown-action"
+            self._outcome(msg["request_id"], "rejected",
+                          code, None)
+            return
+        if not self.srv.cfg["provider"]["actions_enabled"]:
+            self._outcome(msg["request_id"], "rejected",
+                          "actions-disabled", None)
+            return
         self._outcome(msg["request_id"], "rejected",
-                      "actions-disabled", None)
+                      "actions-unwired", None)
 
     def _do_drawer_read(self, msg):
+        proj = self._drawer_projection()
         self.send_event("patch",
                         {"region": "drawer-items", "revision": 0,
-                         "items": []}, msg["request_id"])
+                         "items": proj["items"]}, msg["request_id"])
+        self.send_event("patch",
+                        {"region": "add-content", "revision": 0,
+                         "items": [proj["add"]]}, msg["request_id"])
         self._outcome(msg["request_id"], "completed", "ok", None)
 
     def _do_drawer_op(self, msg):
+        body = msg["body"]
+        name = body.get("op")
+        if name == "list":
+            self._do_drawer_read(msg)
+            return
+        if name not in drawer_ops.DRAWER_OPS:
+            self._outcome(msg["request_id"], "rejected",
+                          "unknown-op", None)
+            return
+        if not isinstance(body.get("args", {}), dict) or \
+                not isinstance(body.get("expected_revision"), int) or \
+                isinstance(body.get("expected_revision"), bool):
+            self._outcome(msg["request_id"], "rejected",
+                          "bad-payload", None)
+            return
+        # Add-flow writes stay deferred per the plan: honest disabled,
+        # never a pretended browser-local success.
         self._outcome(msg["request_id"], "rejected",
                       "drawer-writes-disabled", None)
 
     def _do_view(self, msg):
         body = msg["body"]
         if not isinstance(body.get("bubble_id"), str) or \
-                not isinstance(body.get("mode"), str):
+                body.get("mode") not in ("standard", "expanded"):
             self._outcome(msg["request_id"], "rejected",
                           "bad-payload", None)
+            return
+        if body["bubble_id"] not in self._known_bubble_ids():
+            self._outcome(msg["request_id"], "rejected",
+                          "unknown-bubble", None)
+            return
+        try:
+            rec = self.srv.clients.get(self.client_id, {})
+            modes = rec.get("view_modes")
+            if not isinstance(modes, dict):
+                modes = {}
+            modes[body["bubble_id"]] = body["mode"]
+            rec["view_modes"] = modes
+            self.srv._save_client(self.client_id, rec)
+        except StoreError:
+            self._outcome(msg["request_id"], "rejected",
+                          "store-unavailable", None)
             return
         self._outcome(msg["request_id"], "completed", "ok", None)
 
@@ -1164,7 +1444,15 @@ class WSConn:
             return
         rec = self.srv.clients.get(self.client_id, {})
         rec["projection_receipt_seq"] = seq
-        self.srv._save_client(self.client_id, rec)
+        try:
+            self.srv._save_client(self.client_id, rec)
+        except StoreError:
+            self._outcome(msg["request_id"], "rejected",
+                          "store-unavailable", None)
+            return
+        # Receipted events leave the outstanding set: healthy readers
+        # never trip backpressure, silent consumers still do.
+        self.unacked = [(s, z) for (s, z) in self.unacked if s > seq]
         self._outcome(msg["request_id"], "completed", "ok", None)
 
     def _do_logout(self, msg):
