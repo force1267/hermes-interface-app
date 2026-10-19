@@ -25,6 +25,15 @@ Environment=PYTHONPATH=/opt/interface-app/releases/current
 # uv retries and exits 1 with no terminal record. With it, the CLI runs on
 # its committed dependencies, exactly like P0/P1 probe runs.
 Environment=HERMES_SUPERVISED_CHILD=1
+# The provider runs turns under the main Hermes home (never a worker
+# profile): pin it explicitly so launches are deterministic, and point uv
+# at the same PyPI mirror the rest of this box uses — files.pythonhosted.org
+# is unreachable from here, so without the mirror the CLI's pending
+# source-completion tail burns ~80s in retries and exits 1 with no result.
+Environment=HERMES_HOME=/root/.hermes
+Environment=UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+Environment=UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+Environment=PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 Restart=on-failure
 RestartSec=5
 # State lives outside release dirs; survives symlink swaps + reboot.
