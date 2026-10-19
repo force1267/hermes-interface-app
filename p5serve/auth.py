@@ -154,22 +154,27 @@ class AuthStore:
         token = _raw_of(cookie_header, self.pre_name)
         if not token or not csrf:
             return False
-        row = self.db.execute(
-            "SELECT challenge_hash, created_at FROM preauth WHERE"
-            " token=?", (token,)).fetchone()
-        if row is None:
-            return False
-        if int(time.time()) - row[1] > self.cfg["auth"][
-                "preauth_seconds"]:
-            self.db.execute("DELETE FROM preauth WHERE token=?",
-                            (token,))
+        # The shared authdb handle is also touched by the adapter's
+        # HTTP threads and the expiry loop, so every use here takes
+        # the store lock: concurrent execute() calls on one sqlite3
+        # connection raise InterfaceError (fail-closed session miss).
+        with self.lock:
+            row = self.db.execute(
+                "SELECT challenge_hash, created_at FROM preauth WHERE"
+                " token=?", (token,)).fetchone()
+            if row is None:
+                return False
+            if int(time.time()) - row[1] > self.cfg["auth"][
+                    "preauth_seconds"]:
+                self.db.execute("DELETE FROM preauth WHERE token=?",
+                                (token,))
+                self.db.commit()
+                return False
+            ok = hmac.compare_digest(
+                row[0], hashlib.sha256(csrf.encode()).hexdigest())
+            self.db.execute("DELETE FROM preauth WHERE token=?", (token,))
             self.db.commit()
-            return False
-        ok = hmac.compare_digest(
-            row[0], hashlib.sha256(csrf.encode()).hexdigest())
-        self.db.execute("DELETE FROM preauth WHERE token=?", (token,))
-        self.db.commit()
-        return ok
+            return ok
 
     # -- rate limits --
     def _limited(self, scope, window, maximum):
@@ -267,10 +272,16 @@ class AuthStore:
 
     def check_session_by_hash(self, th):
         a = self.cfg["auth"]
-        row = self.db.execute(
-            "SELECT account_id, credential_epoch, absolute_expires_at,"
-            " idle_expires_at, last_seen_at, revoked_at FROM sessions"
-            " WHERE token_hash=?", (th,)).fetchone()
+        # Read path takes the same lock as the write path: the
+        # adapter calls this from HTTP/WS threads while the expiry
+        # loop sweeps, and concurrent execute() on the shared
+        # connection raises InterfaceError (fail-closed miss).
+        with self.lock:
+            row = self.db.execute(
+                "SELECT account_id, credential_epoch,"
+                " absolute_expires_at,"
+                " idle_expires_at, last_seen_at, revoked_at FROM sessions"
+                " WHERE token_hash=?", (th,)).fetchone()
         if row is None or row[5] is not None:
             return False, None
         now = int(time.time())
@@ -297,10 +308,11 @@ class AuthStore:
 
     def expire_sweep(self):
         now = int(time.time())
-        rows = self.db.execute(
-            "SELECT token_hash, account_id, credential_epoch,"
-            " absolute_expires_at, idle_expires_at FROM sessions"
-            " WHERE revoked_at IS NULL").fetchall()
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT token_hash, account_id, credential_epoch,"
+                " absolute_expires_at, idle_expires_at FROM sessions"
+                " WHERE revoked_at IS NULL").fetchall()
         rec = self.load_record()
         epoch = rec["credential_epoch"] if rec else None
         dead = []
@@ -333,9 +345,10 @@ class AuthStore:
         th = token_hash_of(cookie_header, self.cookie_name)
         if not th:
             return False
-        row = self.db.execute(
-            "SELECT csrf_hash FROM sessions WHERE token_hash=?",
-            (th,)).fetchone()
+        with self.lock:
+            row = self.db.execute(
+                "SELECT csrf_hash FROM sessions WHERE token_hash=?",
+                (th,)).fetchone()
         if row is None:
             return False
         return hmac.compare_digest(
@@ -351,9 +364,10 @@ class AuthStore:
         return tok
 
     def check_ws_token(self, th, csrf):
-        row = self.db.execute(
-            "SELECT ws_token_hash FROM sessions WHERE token_hash=?",
-            (th,)).fetchone()
+        with self.lock:
+            row = self.db.execute(
+                "SELECT ws_token_hash FROM sessions WHERE token_hash=?",
+                (th,)).fetchone()
         if row is None:
             return False
         return hmac.compare_digest(

@@ -2551,5 +2551,55 @@ class T_S032_DeathCursorPins(ServingBase):
         self.assertEqual(rej2["body"]["code"], "unknown-action")
 
 
+class T_SessionConcurrencyStorm(ServingBase):
+    def test_concurrent_session_storm(self):
+        # t_7e8889fe: HTTP threads, WS threads and the expiry loop
+        # share one authdb handle; concurrent execute() on it used to
+        # raise InterfaceError (fail-closed session miss, seen once in
+        # go-live journal). 50 threads storm the read paths; no
+        # InterfaceError/ProgrammingError may escape, and fail-closed
+        # behaviour (valid=True, bogus=False) must hold afterwards.
+        self.start_stack()
+        ck = self.login()
+        th = authmod.token_hash_of(
+            ck, self.srv.cfg["auth"]["cookie_name"])
+        self.assertTrue(th)
+        stop = time.time() + 5
+        errors = []
+        lock = threading.Lock()
+
+        def worker(seed):
+            i = 0
+            try:
+                while time.time() < stop:
+                    pick = (seed + i) % 4
+                    if pick == 0:
+                        self.srv.authdb.check_session_by_hash(th)
+                    elif pick == 1:
+                        self.srv.authdb.expire_sweep()
+                    elif pick == 2:
+                        self.srv.authdb.check_ws_token(th, "bogus")
+                    else:
+                        self.srv.authdb.check_session(ck)
+                    i += 1
+            except Exception as e:  # noqa - the test fails on any escape
+                with lock:
+                    errors.append("%s: %s" % (type(e).__name__, e))
+
+        threads = [threading.Thread(target=worker, args=(s,))
+                   for s in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        ok, sess = self.srv.authdb.check_session(ck)
+        self.assertTrue(ok)
+        self.assertIsNotNone(sess)
+        ok2, sess2 = self.srv.authdb.check_session_by_hash("0" * 64)
+        self.assertFalse(ok2)
+        self.assertIsNone(sess2)
+
+
 if __name__ == "__main__":
     unittest.main()
