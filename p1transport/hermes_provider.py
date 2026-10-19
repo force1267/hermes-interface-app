@@ -115,6 +115,11 @@ class HermesProvider:
             "stdout_line_bytes", 1048576)
         self.actions_enabled = bool(s.get("actions_enabled", False))
         self.account_id = account_id or s.get("account_id", "mj")
+        # Operational policy with safe fallbacks (provider settings are
+        # optional extras, never REQUIRED): listen backlog and SQLite
+        # busy budget. Wire sizes/close codes stay protocol invariants.
+        self.listen_backlog = s.get("listen_backlog", 16)
+        self.sqlite_busy_seconds = s.get("sqlite_busy_seconds", 2)
         self.db_path = db_path
         self.service_secret = service_secret or ""
         self._lock = threading.Lock()
@@ -127,7 +132,7 @@ class HermesProvider:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         os.makedirs(self.workspace, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False,
-                                   timeout=10)
+                                   timeout=self.sqlite_busy_seconds)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._db.commit()
@@ -148,7 +153,7 @@ class HermesProvider:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind((self.bind_host, self.bind_port))
-        self._listener.listen(16)
+        self._listener.listen(self.listen_backlog)
         self._thread = threading.Thread(target=self._accept_loop,
                                         daemon=True)
         self._thread.start()

@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import secrets as _secrets
+import select as _select
 import socket
 import sqlite3 as _sqlite3
 import struct
@@ -92,6 +93,12 @@ class AdapterServer:
         self.sockets_lock = threading.Lock()
         self.up = None      # upstream Client or None
         self.up_lock = threading.Lock()
+        # Split liveness: the WS transport has its own ping/pong; the
+        # upstream provider connection is probed separately (peek +
+        # monitor, never user traffic). up_dead means the shell must say
+        # so and refuse nothing silently; last-known reads stay served.
+        self.up_dead = False
+        self._upstream_ever_ok = False
         self.up_cursor = None
         self.up_last_seen = []
         self.inflight = {}  # (conversation_id) -> count
@@ -112,11 +119,15 @@ class AdapterServer:
                 self.asset_hashes[name] = ""
         self.shell_doc = self._build_shell()
         threading.Thread(target=self._expiry_loop, daemon=True).start()
+        threading.Thread(target=self._upstream_monitor_loop,
+                         daemon=True).start()
 
     def _open_db(self):
         """Service-owned handle on the state db honoring sqlite_busy_seconds."""
         db = _sqlite3.connect(self.cfg["adapter"]["state_db"],
-                              check_same_thread=False, timeout=10)
+                              check_same_thread=False,
+                              timeout=self.cfg["adapter"][
+                                  "sqlite_busy_seconds"])
         db.execute("PRAGMA journal_mode=WAL")
         try:
             ms = int(self.cfg["adapter"]["sqlite_busy_seconds"]) * 1000
@@ -138,6 +149,7 @@ class AdapterServer:
             "frame_max_height": a["frame_max_height"],
             "frame_ready_timeout_seconds": a[
                 "frame_ready_timeout_seconds"],
+            "close_log_entries": a["close_log_entries"],
             "outbound_messages": a["outbound_messages"],
             "outbound_bytes": a["outbound_bytes"],
         }
@@ -508,39 +520,46 @@ class AdapterServer:
         with self.up_lock:
             if self.up is not None:
                 return self.up
-            u = self.cfg["upstream"]
-            c = Client("adapter-" + os.path.basename(
-                self.cfg["adapter"]["state_db"]),
-                supported_versions=[dict(protocol.V10)], caps=[])
-            extra = None
-            try:
-                with open(u["service_secret_file"]) as f:
-                    secret = f.read().strip()
-                if secret:
-                    extra = {"service_auth": secret}
-            except OSError:
-                extra = None
-            c.connect(u["host"], u["port"], resume=True, extra=extra)
-            try:
-                c._sock.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_KEEPALIVE,
-                    1 if u["tcp_keepalive"] else 0)
-                if u["tcp_keepalive"]:
-                    for name, val in (
-                            ("TCP_KEEPIDLE", u["tcp_idle_seconds"]),
-                            ("TCP_KEEPINTVL", u["tcp_interval_seconds"]),
-                            ("TCP_KEEPCNT", u["tcp_probes"])):
-                        opt = getattr(socket, name, None)
-                        if opt is not None:
-                            try:
-                                c._sock.setsockopt(
-                                    socket.IPPROTO_TCP, opt, val)
-                            except OSError:
-                                pass
-            except (OSError, AttributeError):
-                pass
+            c = self._dial_upstream()
             self.up = c
+            self._upstream_ever_ok = True
             return c
+
+    def _dial_upstream(self):
+        """One fresh resume connection. Raises on failure; the caller
+        decides whether the old cached object lives or dies."""
+        u = self.cfg["upstream"]
+        c = Client("adapter-" + os.path.basename(
+            self.cfg["adapter"]["state_db"]),
+            supported_versions=[dict(protocol.V10)], caps=[])
+        extra = None
+        try:
+            with open(u["service_secret_file"]) as f:
+                secret = f.read().strip()
+            if secret:
+                extra = {"service_auth": secret}
+        except OSError:
+            extra = None
+        c.connect(u["host"], u["port"], resume=True, extra=extra)
+        try:
+            c._sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_KEEPALIVE,
+                1 if u["tcp_keepalive"] else 0)
+            if u["tcp_keepalive"]:
+                for name, val in (
+                        ("TCP_KEEPIDLE", u["tcp_idle_seconds"]),
+                        ("TCP_KEEPINTVL", u["tcp_interval_seconds"]),
+                        ("TCP_KEEPCNT", u["tcp_probes"])):
+                    opt = getattr(socket, name, None)
+                    if opt is not None:
+                        try:
+                            c._sock.setsockopt(
+                                socket.IPPROTO_TCP, opt, val)
+                        except OSError:
+                            pass
+        except (OSError, AttributeError):
+            pass
+        return c
 
     def upstream_drop(self):
         with self.up_lock:
@@ -550,6 +569,182 @@ class AdapterServer:
                 except OSError:
                     pass
                 self.up = None
+
+    # -- upstream liveness, split from the WS transport --
+    def _note_dead(self):
+        """Flag the provider unreachable. True only on transition."""
+        with self.up_lock:
+            if self.up_dead:
+                return False
+            self.up_dead = True
+            return True
+
+    def _note_alive(self):
+        """Flag the provider reachable. True only on transition."""
+        with self.up_lock:
+            self._upstream_ever_ok = True
+            if not self.up_dead:
+                return False
+            self.up_dead = False
+            return True
+
+    @staticmethod
+    def _socket_alive(up):
+        """Peek without touching timeouts or consuming bytes.
+
+        A readable socket with an empty peek means the peer shut down
+        (FIN/RST); an unreadable one is idle but live. Never mutates
+        the socket timeout: reader threads own their deadlines.
+        """
+        try:
+            sock = up._sock
+            if sock is None:
+                return False
+            try:
+                sock.getpeername()
+            except OSError:
+                return False
+            try:
+                ready, _, _ = _select.select([sock], [], [], 0)
+            except (OSError, ValueError):
+                return False
+            if not ready:
+                return True
+            try:
+                probe = sock.recv(1, socket.MSG_PEEK)
+            except (OSError, ValueError):
+                return False
+            return probe != b""
+        except Exception:
+            return False
+
+    def _recover_upstream(self):
+        """Fresh resume connection preserving last-known client state.
+
+        Dials first: only a successful new connection replaces (and
+        closes) the old one, so a failed attempt keeps last-known
+        bubbles/cursor available for reads. Returns the live Client
+        or None. Never raises.
+        """
+        with self.up_lock:
+            old = self.up
+        try:
+            new = self._dial_upstream()
+        except Exception:
+            return None
+        if old is not None:
+            try:
+                new.bubbles = [dict(b) for b in old.bubbles]
+                new._seen = set(old._seen)
+                if old.cursor is not None:
+                    new.cursor = old.cursor
+                if old.session is not None:
+                    new.session = old.session
+            except AttributeError:
+                pass
+        with self.up_lock:
+            if self.up is old:
+                if old is not None:
+                    try:
+                        old.close()
+                    except OSError:
+                        pass
+                self.up = new
+                self._upstream_ever_ok = True
+                return new
+            current = self.up
+        # A concurrent recovery already replaced the handle; drop the
+        # spare connection instead of leaking it, and report whatever
+        # is current so the caller never treats a closed dial as live.
+        try:
+            new.close()
+        except OSError:
+            pass
+        return current
+
+    def _live_upstream(self):
+        """Best-effort (Client-or-None, alive-bool); never raises.
+
+        The cached handle is never trusted: a peek decides. A dead
+        cached object stays readable (last-known-good) while one fast
+        loopback reconnect is attempted; only success replaces it.
+        """
+        with self.up_lock:
+            up = self.up
+        if up is not None and self._socket_alive(up):
+            return up, True
+        # No usable cached handle: one fast loopback dial, exactly like
+        # the old unconditional connect. Refused backends stay down;
+        # only the timed monitor refrains from dialling storms.
+        self._recover_upstream()
+        with self.up_lock:
+            up = self.up
+        if up is not None and self._socket_alive(up):
+            return up, True
+        return up, False
+
+    def broadcast_status_all(self, state, detail):
+        """One status event to every live socket (death/recovery push)."""
+        with self.sockets_lock:
+            conns = [c for lst in self.sockets.values() for c in lst
+                     if not c.closed]
+        for c in conns:
+            try:
+                c.send_event("status",
+                             {"state": state, "detail": detail}, None)
+            except Exception:
+                pass
+
+    def _monitor_tick(self):
+        """Background liveness: death push without user traffic, and
+        automatic recovery without reload once the provider is back."""
+        with self.up_lock:
+            up = self.up
+        if up is None:
+            if not (self._upstream_ever_ok and self.up_dead):
+                return
+            self._recover_upstream()
+            if self._recovered():
+                self.broadcast_status_all(
+                    "ready", "backend recovered")
+            return
+        if self._socket_alive(up):
+            if self._note_alive():
+                self.broadcast_status_all("ready", "backend recovered")
+            return
+        if self._note_dead():
+            self.broadcast_status_all("backend-unavailable",
+                                      "backend unreachable")
+            return
+        # Already flagged down: probe recovery; only a verified live
+        # handle clears the flag and pushes ready.
+        self._recover_upstream()
+        if self._recovered():
+            self.broadcast_status_all("ready", "backend recovered")
+
+    def _recovered(self):
+        """True only on the down->up transition (verified, then noted)."""
+        with self.up_lock:
+            up = self.up
+        if up is None or not self._socket_alive(up):
+            return False
+        return self._note_alive()
+
+    def _upstream_monitor_loop(self):
+        while not self._closed:
+            try:
+                period = self.cfg["adapter"]["upstream_check_seconds"]
+            except (KeyError, TypeError):
+                period = 2
+            if not isinstance(period, int) or period <= 0:
+                period = 2
+            time.sleep(period)
+            if self._closed:
+                break
+            try:
+                self._monitor_tick()
+            except Exception:
+                pass
 
     def policy_ok(self):
         if not self.policy.get("revision"):
@@ -857,6 +1052,17 @@ class WSConn:
         except ValueError:
             self._outcome(None, "rejected", "bad-envelope", None)
             return
+        # json_depth is operational policy (R4): hostile nesting is
+        # rejected before any dispatch, never parsed deeper.
+        try:
+            too_deep = _json_depth(msg) > self.a["json_depth"]
+        except (RecursionError, ValueError):
+            too_deep = True
+        if too_deep:
+            self._outcome(msg.get("request_id")
+                          if isinstance(msg, dict) else None,
+                          "rejected", "bad-envelope", None)
+            return
         if not isinstance(msg, dict):
             self._outcome(None, "rejected", "bad-envelope", None)
             return
@@ -927,9 +1133,11 @@ class WSConn:
 
     # -- ops --
     def _outcome(self, request_id, status, code, message_id,
-                 cursor=None):
+                 cursor=None, sent_text=None):
         body = {"status": status, "code": code,
                 "message_id": message_id, "cursor": cursor}
+        if sent_text is not None:
+            body["sent_text"] = sent_text
         self.event_seq += 1
         self.send_text(
             {"v": 1, "kind": "event", "request_id": request_id,
@@ -1034,10 +1242,20 @@ class WSConn:
     def _push_snapshot(self, request_id, resync=False):
         bubbles, conv, alive = self._domain_snapshot()
         drawer = self._drawer_projection()
+        try:
+            rec = self.srv.clients.get(self.client_id, {})
+            pins = [it["id"] for it in drawer["items"]
+                    if it.get("pinned") and it.get("id")]
+            if rec.get("pins", []) != pins:
+                rec["pins"] = pins
+                self.srv._save_client(self.client_id, rec)
+        except StoreError:
+            raise
         self.send_event("snapshot",
                         {"conversation_id": conv,
                          "revision": len(bubbles),
                          "cursor": self.srv.up_cursor,
+                         "backend_alive": alive,
                          "bubbles": bubbles, "drawer": drawer,
                          "pending": [p for p in
                                      self.srv.pending.values() if
@@ -1066,20 +1284,23 @@ class WSConn:
         rec = self.srv.clients.get(self.client_id, {})
         modes = rec.get("view_modes", {}) if isinstance(
             rec.get("view_modes"), dict) else {}
-        try:
-            up = self.srv.upstream()
-            sess = up.session or {}
-            bubbles = [{"id": b["id"], "revision": b["revision"],
+        # Liveness is observed, never assumed from a cached handle: a
+        # dead provider still serves its last-known bubbles plus the
+        # durable assistant record, flagged for the stale banner.
+        up, alive = self.srv._live_upstream()
+        # Reads stay last-known-good while down (stale-flagged by the
+        # caller); only the alive bit gates fresh backend contact.
+        bubbles = []
+        if up is not None:
+            try:
+                bubbles = [{"id": b["id"], "revision": b["revision"],
                         "major": b["major"], "text": b["text"],
                         "preview_html": None, "frame_payload": None,
                         "role": "user",
                         "mode": modes.get(b["id"], "standard")}
                        for b in up.bubbles]
-            alive = True
-        except (ConnectionLost, OSError, ValueError):
-            self.srv.upstream_drop()
-            alive = False
-            bubbles = []
+            except (AttributeError, KeyError, TypeError):
+                bubbles = []
         assist = []
         for b in rec.get("assistant", []):
             b = dict(b)
@@ -1090,16 +1311,13 @@ class WSConn:
         return bubbles, conv, alive
 
     def _do_snapshot(self, msg):
+        # Liveness lives in _domain_snapshot via observed liveness: a
+        # dead backend yields cached history plus the unavailable
+        # status event, never a hang on a stale handle.
         try:
-            self.srv.upstream()
-        except (ConnectionLost, OSError, ValueError):
-            self.srv.upstream_drop()
-            self.send_event("status",
-                            {"state": "backend-unavailable",
-                             "detail": "backend unreachable"},
-                            msg["request_id"])
-            return
-        self._push_snapshot(msg["request_id"])
+            self._push_snapshot(msg["request_id"])
+        except StoreError:
+            self.close(1011, "store-unavailable")
 
     def _admit_write(self, msg, conversation_id):
         ok, why = self.srv.policy_ok()
@@ -1116,6 +1334,13 @@ class WSConn:
         pol = self.srv.policy
         qmax = pol.get("queue_max_messages")
         if qmax is not None and len(self.srv.pending) >= qmax:
+            self._outcome(msg["request_id"], "rejected", "busy", None)
+            return False
+        # Agent-owned byte admission (policy.file), enforced alongside
+        # the static safety backstop: the tighter bound wins.
+        qbmax = pol.get("queue_max_bytes")
+        if qbmax is not None and sum(len(json.dumps(p)) for p in
+               self.srv.pending.values()) >= qbmax:
             self._outcome(msg["request_id"], "rejected", "busy", None)
             return False
         smax = self.a["queue_safety_messages"]
@@ -1175,24 +1400,25 @@ class WSConn:
 
     def _exec_send(self, ws_req, request_id, cid, text):
         try:
-            up = self.srv.upstream()
+            up, alive = self.srv._live_upstream()
+            if not alive or up is None:
+                self._finish(ws_req, request_id, cid,
+                             "outcome-unknown", "unknown", None)
+                return
             payload = json.dumps(
                 {"text": text, "conversation_id": cid,
                  "request_id": request_id}, sort_keys=True)
             env = protocol.mk_text_envelope(
                 "ws-" + request_id, 0, payload.encode("utf-8"))
             reply = self._upstream_roundtrip(up, env, payload)
-            try:
-                self._record_upstream_state(up)
-            except Exception:
-                self._finish(ws_req, request_id, cid,
-                             "outcome-unknown", "unknown", None)
-                return
             term_text = self._result_text(reply)
             if term_text is None:
                 self._finish(ws_req, request_id, cid,
                              "outcome-unknown", "unknown", None)
                 return
+            # Cursor and bubbles land BEFORE the durable record, so the
+            # persisted cursor is always the latest completed answer,
+            # never one turn behind.
             try:
                 up._add_bubble(env["id"], 0,
                                env["version"]["major"], text)
@@ -1204,13 +1430,21 @@ class WSConn:
                 except AttributeError:
                     pass
             try:
+                self._record_upstream_state(up)
+            except Exception:
+                self._finish(ws_req, request_id, cid,
+                             "outcome-unknown", "unknown", None)
+                return
+            try:
                 self._render_and_patch(ws_req, request_id, cid, text,
                                        term_text)
             except StoreError:
                 self._finish(ws_req, request_id, cid,
                              "outcome-unknown", "unknown", None)
         except (ConnectionLost, OSError, ValueError):
-            self.srv.upstream_drop()
+            if self.srv._note_dead():
+                self.srv.broadcast_status_all("backend-unavailable",
+                                              "backend unreachable")
             self._finish(ws_req, request_id, cid, "outcome-unknown",
                          "unknown", None)
         finally:
@@ -1323,18 +1557,26 @@ class WSConn:
                             {"region": "bubbles", "revision": 1,
                              "items": [bubble]}, ws_req)
         self._finish(ws_req, request_id, cid, "completed", "ok",
-                     bubble["id"])
+                     bubble["id"],
+                     # The completed outcome echoes the sent text
+                     # (bounded: events must fit the frame) so the shell
+                     # clears exactly the draft that completed — never a
+                     # newer unsent draft, never a replay. Unknown
+                     # outcomes carry no text: the shell keeps the draft.
+                     text if len(text) <= 2048 else None)
 
     def _finish(self, ws_req, request_id, cid, status, code,
-                message_id):
+                message_id, sent_text=None):
         pend = self.srv.pending.get(request_id)
         if pend is not None:
             pend["state"] = status
         body = {"status": status, "code": code,
                 "message_id": message_id, "cursor": message_id}
+        if sent_text is not None:
+            body["sent_text"] = sent_text
         if self.client_id is None:
             self._outcome(ws_req, status, code, message_id,
-                          cursor=message_id)
+                          cursor=message_id, sent_text=sent_text)
             return
         # Broadcast: a reload may have moved this logical client to a
         # new generation; the completion must reach the live socket.
@@ -1371,6 +1613,24 @@ class WSConn:
                 code = "unknown-action"
             self._outcome(msg["request_id"], "rejected",
                           code, None)
+            return
+        # The surface must have been issued to this client: an unknown
+        # or missing fragment id is not a registered action, even with
+        # a live channel token. Derived from the durable record, so a
+        # restart cannot widen it.
+        issued = set()
+        try:
+            for b in rec.get("assistant", []):
+                fp = (b or {}).get("frame_payload") or {}
+                fid = fp.get("fragment_id")
+                if isinstance(fid, str) and fid:
+                    issued.add(fid)
+        except AttributeError:
+            pass
+        frag = body.get("fragment_id")
+        if not isinstance(frag, str) or frag not in issued:
+            self._outcome(msg["request_id"], "rejected",
+                          "unknown-action", None)
             return
         if not self.srv.cfg["provider"]["actions_enabled"]:
             self._outcome(msg["request_id"], "rejected",
@@ -1475,6 +1735,25 @@ def _no_dupes(pairs):
             raise ValueError(f"duplicate-key: {k}")
         obj[k] = v
     return obj
+
+
+def _json_depth(obj):
+    """Nesting depth of a parsed JSON value (scalars sit at 0)."""
+    if isinstance(obj, dict):
+        deep = 0
+        for v in obj.values():
+            d = _json_depth(v)
+            if d > deep:
+                deep = d
+        return deep + 1
+    if isinstance(obj, list):
+        deep = 0
+        for v in obj:
+            d = _json_depth(v)
+            if d > deep:
+                deep = d
+        return deep + 1
+    return 0
 
 
 def _no_const(v):

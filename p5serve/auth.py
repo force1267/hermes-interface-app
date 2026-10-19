@@ -52,7 +52,11 @@ CREATE TABLE IF NOT EXISTS clients(
 
 def sqlite(db_path, busy_seconds=2):
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    db = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+    # Both the connect-level timeout and the busy PRAGMA honor the
+    # configured busy budget; a literal here would silently win the
+    # race before the PRAGMA applies.
+    db = sqlite3.connect(db_path, check_same_thread=False,
+                         timeout=busy_seconds)
     db.execute("PRAGMA journal_mode=WAL")
     try:
         db.execute("PRAGMA busy_timeout=%d" % (int(busy_seconds) * 1000))
@@ -124,8 +128,13 @@ class AuthStore:
 
     # -- pre-auth challenge --
     def new_preauth(self):
-        token = secrets.token_urlsafe(24)
-        challenge = secrets.token_urlsafe(32)
+        # Token sizes are operational policy: token_bytes for the opaque
+        # pre-auth token, csrf_bytes for the single-use challenge. Raw
+        # byte counts go straight to token_urlsafe (which takes bytes,
+        # not characters); the wire carries base64url text either way.
+        token = secrets.token_urlsafe(self.cfg["auth"]["token_bytes"])
+        challenge = secrets.token_urlsafe(
+            self.cfg["auth"]["csrf_bytes"])
         with self.lock:
             self._purge_preauth()
             self.db.execute(
@@ -203,9 +212,12 @@ class AuthStore:
                 username != a["account_id"] or \
                 not self.verify_password(password, rec):
             return False, "", "bad-credentials"
-        token = secrets.token_urlsafe(32)
-        csrf_tok = secrets.token_urlsafe(32)
-        ws_tok = secrets.token_urlsafe(32)
+        # Session and synchronizer sizes follow the same policy:
+        # token_bytes for the session identifier, csrf_bytes for the
+        # CSRF/WS channel tokens.
+        token = secrets.token_urlsafe(a["token_bytes"])
+        csrf_tok = secrets.token_urlsafe(a["csrf_bytes"])
+        ws_tok = secrets.token_urlsafe(a["csrf_bytes"])
         now = int(time.time())
         with self.lock:
             self.db.execute(
@@ -309,7 +321,7 @@ class AuthStore:
         th = token_hash_of(cookie_header, self.cookie_name)
         if not th:
             return ""
-        tok = secrets.token_urlsafe(32)
+        tok = secrets.token_urlsafe(self.cfg["auth"]["csrf_bytes"])
         with self.lock:
             self.db.execute(
                 "UPDATE sessions SET csrf_hash=? WHERE token_hash=?",
@@ -330,7 +342,7 @@ class AuthStore:
             row[0], hashlib.sha256((csrf or "").encode()).hexdigest())
 
     def rotate_ws_token(self, th):
-        tok = secrets.token_urlsafe(32)
+        tok = secrets.token_urlsafe(self.cfg["auth"]["csrf_bytes"])
         with self.lock:
             self.db.execute(
                 "UPDATE sessions SET ws_token_hash=? WHERE token_hash=?",

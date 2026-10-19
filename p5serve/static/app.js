@@ -1,8 +1,9 @@
 /* Thin transport shim. No rendering policy, no page data channel.
    One socket only: the /app/ws transport. All operational thresholds
-   (draft bound, reconnect backoff, frame clamp) arrive in the welcome
-   client_policy; this file owns no numeric policy of its own. Drafts stay
-   in sessionStorage (account+conversation scoped, never credentials). */
+   (draft bound, reconnect backoff, frame clamp, close-log retention,
+   frame ready timeout) arrive in the welcome client_policy; this file
+   owns no numeric policy of its own. Drafts stay in
+   sessionStorage (account+conversation scoped, never credentials). */
 (function () {
   "use strict";
   var RELEASE_ID = (document.querySelector('meta[name="release-id"]') || {}).content || "dev";
@@ -20,10 +21,11 @@
     frameDoc = fdEl ? JSON.parse(fdEl.textContent) : null;
   } catch (e) { frameDoc = null; }
   var state = { ws: null, csrf: null, clientId: null, generation: 0,
-    seq: 0, conversationId: null, pendingText: null, attempt: 0,
+    seq: 0, conversationId: null, attempt: 0,
     openTime: 0, policy: null, frameToken: null, frameContext: null,
     frameActions: [], frameReady: false, forms: {}, lastSeq: 0,
-    pendingRenders: [], awaiting: {} };
+    pendingRenders: [], pending: {}, knownFragments: {},
+    wasDown: false, frameTimer: null, fenceIgnored: 0 };
 
   function setStatus(s, detail) {
     statusEl.textContent = s + (detail ? ": " + detail : "");
@@ -32,6 +34,12 @@
   }
   function draftKey() {
     return "draft:" + state.conversationId;
+  }
+  function doneKey() {
+    // Single-use marker for the exact text that already completed, so a
+    // completion that lands before its snapshot resync cannot resurrect
+    // the sent prompt as a draft. Consumed by the next loadDraft.
+    return "draftDone:" + state.conversationId;
   }
   function draftBound() {
     var b = state.policy && state.policy.draft_bytes;
@@ -48,10 +56,41 @@
   }
   function loadDraft() {
     try {
+      var done = state.conversationId ?
+        sessionStorage.getItem(doneKey()) : null;
+      if (done !== null) {
+        // Consume the marker: it covers exactly one snapshot race.
+        // A genuinely retyped identical draft is saved fresh by input
+        // events afterwards and must load normally next time.
+        sessionStorage.removeItem(doneKey());
+        var cur = state.conversationId ?
+          sessionStorage.getItem(draftKey()) : null;
+        if (cur === done) {
+          try { sessionStorage.removeItem(draftKey()); } catch (e2) {}
+          return;
+        }
+        if (cur) input.value = cur;
+        return;
+      }
       var d = state.conversationId ?
         sessionStorage.getItem(draftKey()) : null;
       if (d) input.value = d;
     } catch (e) { /* ignore */ }
+  }
+  // The sent text that completed: clear the composer and the stored
+  // draft only when they still hold exactly that text. Anything newer
+  // the user typed is an unsent draft and is preserved.
+  function noteCompletedText(done) {
+    if (typeof done !== "string" || !done) return;
+    try {
+      if (state.conversationId) {
+        if (sessionStorage.getItem(draftKey()) === done) {
+          sessionStorage.removeItem(draftKey());
+        }
+        sessionStorage.setItem(doneKey(), done);
+      }
+    } catch (e) { /* ignore */ }
+    if (input.value === done) input.value = "";
   }
   function nextReq() { state.seq += 1; return "web-" + Date.now() + "-" + state.seq; }
   function send(op, body, csrf) {
@@ -61,14 +100,19 @@
       request_id: id, client_id: state.clientId,
       generation: state.generation, csrf: (csrf === undefined ? state.csrf : csrf),
       op: op, body: body || {} }));
-    state.awaiting[id] = op;
+    state.pending[id] = { op: op };
     var cap = (state.policy && state.policy.outbound_messages) || 0;
     if (cap > 0) {
-      var keys = Object.keys(state.awaiting);
+      var keys = Object.keys(state.pending);
       while (keys.length > cap) {
-        delete state.awaiting[keys.shift()];
+        delete state.pending[keys.shift()];
       }
     }
+  }
+  function fenceFail() {
+    // Ignored frame event (wrong channel or unknown surface). Counted
+    // for the confinement gate; never forwarded, never rendered.
+    state.fenceIgnored += 1;
   }
   function bubbleMode(id) {
     var a = bubblesEl.querySelector('[data-bubble-id="' + CSS.escape(id) + '"]');
@@ -101,6 +145,12 @@
     }
     return a;
   }
+  function trackFragment(b) {
+    var fp = b && b.frame_payload;
+    if (fp && typeof fp.fragment_id === "string" && fp.fragment_id) {
+      state.knownFragments[fp.fragment_id] = 1;
+    }
+  }
   function postFrame(msg) {
     if (!state.frameReady) return;
     try {
@@ -109,25 +159,20 @@
     } catch (e) { /* frame not ready; next ready re-syncs */ }
   }
   function forceInit() {
-    // Post init without the frameReady gate: after a same-value srcdoc
-    // re-mount the frame may not reload (no second "loaded"), so the
-    // welcome credentials must also go out on this path. A mid-reload
+    // Post init without the frameReady gate: after an in-place welcome
+    // (same srcdoc, no reload) there is no second "loaded", so the
+    // rotated credentials must also go out on this path. A mid-reload
     // frame drops it harmlessly; its "loaded" triggers the gated init.
+    // Null credentials pre-welcome are ignored by the frame; the real
+    // welcome re-inits.
     try {
       frame.contentWindow.postMessage({ op: "init",
         token: state.frameToken, context: state.frameContext,
         actions: state.frameActions }, "*");
     } catch (e) { /* next loaded retries */ }
   }
-  function renderToFrame(b) {
-    var fp = b && b.frame_payload;
-    if (!fp || !fp.tree) return;
-    if (!state.frameReady) {
-      state.pendingRenders.push(b);
-      var cap = (state.policy && state.policy.outbound_messages) || 0;
-      while (state.pendingRenders.length > cap) state.pendingRenders.shift();
-      return;
-    }
+  function renderJob(b) {
+    var fp = b.frame_payload;
     postFrame({ op: "render", payload: {
       tree: fp.tree, kind: fp.kind || "text",
       fragment_id: fp.fragment_id || b.id,
@@ -135,17 +180,55 @@
       preview: (fp.preview !== false) && bubbleMode(b.id) !== "expanded"
     }});
   }
+  function renderToFrame(b) {
+    var fp = b && b.frame_payload;
+    if (!fp || !fp.tree) return;
+    trackFragment(b);
+    if (!state.frameReady) {
+      state.pendingRenders.push(b);
+      var cap = (state.policy && state.policy.outbound_messages) || 0;
+      while (state.pendingRenders.length > cap) state.pendingRenders.shift();
+      return;
+    }
+    renderJob(b);
+  }
+  function armFrameTimer() {
+    if (state.frameTimer) {
+      try { clearTimeout(state.frameTimer); } catch (e) {}
+      state.frameTimer = null;
+    }
+    var P = state.policy;
+    var t = (P && typeof P.frame_ready_timeout_seconds === "number") ?
+      P.frame_ready_timeout_seconds : 0;
+    if (!(t > 0)) return;
+    state.frameTimer = setTimeout(function () {
+      state.frameTimer = null;
+      if (!state.frameReady) {
+        // A fresh frame document never signalled: retry the init once
+        // and mark the mount degraded. Parent text already shows the
+        // answers; the next "loaded" clears the mark and re-syncs.
+        forceInit();
+        try { frame.dataset.degraded = "no-frame-ready"; } catch (e2) {}
+      }
+    }, t * 1000);
+  }
   function mountFrame() {
     if (!frameDoc || frame.getAttribute("srcdoc") === frameDoc) return;
     state.frameReady = false;
     frame.setAttribute("srcdoc", frameDoc);
   }
   function resetFrame() {
-    try { frame.removeAttribute("srcdoc"); } catch (e) {}
-    state.frameReady = false;
+    // Stable mount: the srcdoc bytes are identical across welcomes, so
+    // rewriting them would only risk a second navigation racing the
+    // frame's load signal. Only a changed bundle remounts; credential
+    // rotation re-inits in place via forceInit.
+    if (!frameDoc || frame.getAttribute("srcdoc") !== frameDoc) {
+      try { frame.removeAttribute("srcdoc"); } catch (e) {}
+      state.frameReady = false;
+      mountFrame();
+    }
     state.forms = {};
     state.pendingRenders = [];
-    mountFrame();
   }
   function onEvent(ev) {
     var msg;
@@ -160,12 +243,14 @@
       state.frameContext = msg.body.frame_context || null;
       state.frameActions = msg.body.registered_actions || [];
       resetFrame();
+      armFrameTimer();
       forceInit();
       setStatus("resuming", "");
       send("snapshot", {});
     } else if (msg.op === "snapshot") {
       state.conversationId = msg.body.conversation_id;
       bubblesEl.replaceChildren();
+      state.knownFragments = {};
       (msg.body.bubbles || []).forEach(function (b) {
         bubblesEl.appendChild(bubbleNode(b));
         renderToFrame(b);
@@ -185,13 +270,25 @@
         p.textContent = add.enabled ? "Add is available." : "Add is not enabled yet.";
         addEl.appendChild(p);
       }
-      setStatus("ready", "");
+      // Atomic honesty: the snapshot carries the backend bit, so a
+      // reload while dead never flashes ready before the status event.
+      var alive = (msg.body.backend_alive !== false);
+      if (alive) {
+        state.wasDown = false;
+        setStatus("ready", "");
+        try { bubblesEl.dataset.stale = ""; } catch (e) {}
+      } else {
+        state.wasDown = true;
+        setStatus("backend-unavailable", "cached history; backend unreachable");
+        try { bubblesEl.dataset.stale = "true"; } catch (e2) {}
+      }
       loadDraft();
       var pend = msg.body.pending || [];
       pend.forEach(function () { /* outcome-unknown: surfaced, never resent */ });
       send("receipt", { event_seq: state.lastSeq }, null);
     } else if (msg.op === "patch" && msg.body.region === "bubbles") {
       (msg.body.items || []).forEach(function (b) {
+        trackFragment(b);
         var old = bubblesEl.querySelector(
           '[data-bubble-id="' + CSS.escape(b.id) + '"]');
         var node = bubbleNode(b);
@@ -202,45 +299,58 @@
     } else if (msg.op === "patch" && (msg.body.region === "drawer-items" || msg.body.region === "add-content")) {
       send("snapshot", {});
     } else if (msg.op === "outcome") {
-      // Only the send that caused an outcome drives the composer.
-      // Anything else (receipt acks, broadcast completions for a
-      // previous generation) must not clobber the banner: a receipt
-      // outcome arriving after backend-unavailable once flipped the
-      // shell back to ready.
-      var why = msg.request_id ? state.awaiting[msg.request_id] : null;
-      if (msg.request_id && state.awaiting[msg.request_id]) {
-        delete state.awaiting[msg.request_id];
+      // Correlation survives accepted: only a terminal outcome for the
+      // exact request we sent drives the composer. Anything else is a
+      // broadcast (reload mid-send) that resyncs, never replays.
+      var why = msg.request_id ? state.pending[msg.request_id] : null;
+      if (why) {
+        delete state.pending[msg.request_id];
       }
       var st = msg.body.status;
-      if (why !== "chat.send") {
-        if ((st === "completed" || st === "outcome-unknown") && !why) {
+      if (msg.body && typeof msg.body.sent_text === "string") {
+        noteCompletedText(msg.body.sent_text);
+      }
+      if (!why || why.op !== "chat.send") {
+        if (!why && (st === "completed" || st === "outcome-unknown")) {
           // Broadcast for a command this generation never sent
           // (reload mid-send): resync to pick up the durable result.
           send("snapshot", {});
-        } else if (why === "view.set" && st === "completed") {
+        } else if (why && why.op === "view.set" && st === "completed") {
           send("snapshot", {});
         } else if (why && (st === "rejected" || st === "failed")) {
           setStatus("ready", msg.body.code || st);
         }
+        // Receipt and other non-send outcomes never touch the banner:
+        // a receipt ack landing after backend-unavailable once flipped
+        // the shell back to ready.
         return;
       }
       if (st === "accepted") { setStatus("waiting", ""); }
-      else if (st === "completed") {
-        setStatus("ready", "");
-        try { sessionStorage.removeItem(draftKey()); } catch (e) {}
-        input.value = "";
-      } else if (st === "outcome-unknown") {
+      else if (st === "completed") { setStatus("ready", ""); }
+      else if (st === "outcome-unknown") {
         setStatus("uncertain", "not resent; check history");
       } else if (st === "rejected" || st === "failed") {
         setStatus("ready", msg.body.code || st);
       }
     } else if (msg.op === "status") {
-      setStatus(msg.body.state === "ready" ? "ready" : "down",
-        msg.body.detail || msg.body.state);
-      if (msg.body.state === "backend-unavailable") {
-        bubblesEl.dataset.stale = "true";
+      if (msg.body.state === "reload-required") { location.reload(); return; }
+      if (msg.body.state === "ready") {
+        var recovered = state.wasDown;
+        state.wasDown = false;
+        setStatus("ready", "");
+        try { bubblesEl.dataset.stale = ""; } catch (e) {}
+        // Death pushed while idle; recovery pushes ready. Resync
+        // without reload and without regenerating answers.
+        if (recovered) send("snapshot", {});
+        return;
       }
-      if (msg.body.state === "reload-required") location.reload();
+      if (msg.body.state === "backend-unavailable") {
+        state.wasDown = true;
+        setStatus("backend-unavailable", msg.body.detail || msg.body.state);
+        try { bubblesEl.dataset.stale = "true"; } catch (e2) {}
+        return;
+      }
+      setStatus("down", msg.body.detail || msg.body.state);
     }
   }
   function backoffMs() {
@@ -281,13 +391,16 @@
     ws.addEventListener("message", onEvent);
     ws.addEventListener("close", function (ce) {
       try {
+        var P = state.policy;
+        var cap = (P && typeof P.close_log_entries === "number" &&
+          P.close_log_entries > 0) ? P.close_log_entries : 32;
         var log = JSON.parse(
           sessionStorage.getItem("chat-close-log") || "[]");
         log.push([Date.now(),
                   String((ce && ce.code) || 0) + "/" +
                   String((ce && ce.reason) || ""),
                   state.generation]);
-        while (log.length > 8) log.shift();
+        while (log.length > cap) log.shift();
         sessionStorage.setItem("chat-close-log", JSON.stringify(log));
         sessionStorage.setItem("chat-last-close",
           String((ce && ce.code) || 0) + "/" +
@@ -304,32 +417,65 @@
     var text = input.value;
     if (!text.trim() || !state.conversationId) return;
     saveDraft();
-    state.pendingText = text;
     send("chat.send", { conversation_id: state.conversationId,
       text: text });
   });
   input.addEventListener("input", saveDraft);
   // Single sandboxed frame host: source-checked bridge, no auth in frame.
-  // Frame channel credentials rotate per socket generation; tokenless or
-  // stale-context frame events are ignored, never forwarded.
+  // Frame channel credentials rotate per socket generation; tokenless,
+  // context-stale, or unknown-surface frame events are ignored, never
+  // forwarded. Server-consumed actions forward with their fragment id
+  // for domain validation there; parent-consumed ops (resize,
+  // form-state) are fenced here.
+  window.__chatFenceIgnored = function () { return state.fenceIgnored; };
   window.addEventListener("message", function (e) {
     if (e.source !== frame.contentWindow) return;
     var d = e.data;
     if (!d || typeof d.op !== "string") return;
-    if (d.op === "ready" || d.op === "loaded" || d.op === "rendered" ||
-        d.op === "ok" || d.op === "denied" || d.op === "refused") {
-      if (!state.frameReady) {
+    if (d.op === "ready") {
+      var rst = d.status;
+      if (rst === "loaded") {
+        // Fresh frame document: credential it, then deliver everything
+        // queued while it loaded. Every load re-inits; a stale ready
+        // flag can never strand the channel again.
         state.frameReady = true;
+        if (state.frameTimer) {
+          try { clearTimeout(state.frameTimer); } catch (e2) {}
+          state.frameTimer = null;
+        }
+        try { frame.removeAttribute("data-degraded"); } catch (e3) {}
         postFrame({ op: "init", context: state.frameContext,
           token: state.frameToken, actions: state.frameActions });
         var queued = state.pendingRenders;
         state.pendingRenders = [];
         queued.forEach(function (b) { renderToFrame(b); });
+        return;
+      }
+      if (!state.frameReady) {
+        state.frameReady = true;
+        postFrame({ op: "init", context: state.frameContext,
+          token: state.frameToken, actions: state.frameActions });
+        var q2 = state.pendingRenders;
+        state.pendingRenders = [];
+        q2.forEach(function (b) { renderToFrame(b); });
+        return;
+      }
+      if (state.frameToken && typeof rst === "string" &&
+          (rst === "denied" || rst.indexOf("denied") === 0 ||
+           rst === "refused" || rst.indexOf("refused") === 0)) {
+        // A render was refused after ready (rotated channel, raced
+        // mount): re-init once; the init reply itself never re-triggers.
+        postFrame({ op: "init", context: state.frameContext,
+          token: state.frameToken, actions: state.frameActions });
       }
       return;
     }
     if (d.op === "resize" && typeof d.height === "number" &&
         isFinite(d.height)) {
+      if (d.token !== state.frameToken || d.context !== state.frameContext) {
+        fenceFail();
+        return;
+      }
       var P = state.policy || {};
       var lo = (typeof P.frame_min_height === "number") ? P.frame_min_height : 0;
       var hi = (typeof P.frame_max_height === "number") ? P.frame_max_height : Number.POSITIVE_INFINITY;
@@ -338,19 +484,28 @@
       return;
     }
     if (d.op === "form-state") {
-      if (typeof d.fragment_id === "string" && d.values &&
-          typeof d.values === "object") {
-        state.forms[d.fragment_id] = d.values;
+      if (d.token !== state.frameToken || d.context !== state.frameContext ||
+          typeof d.fragment_id !== "string" ||
+          !state.knownFragments[d.fragment_id] || !d.values ||
+          typeof d.values !== "object") {
+        fenceFail();
+        return;
       }
+      state.forms[d.fragment_id] = d.values;
       return;
     }
     if (d.op !== "action-click") return;
     /* effect-bearing actions are forwarded through the validated WS
        path, never executed here. */
-    if (d.token !== state.frameToken || d.context !== state.frameContext) return;
+    if (d.token !== state.frameToken || d.context !== state.frameContext) {
+      fenceFail();
+      return;
+    }
     if (!state.conversationId || typeof d.action_id !== "string") return;
     send("action.invoke", { conversation_id: state.conversationId,
-      action_id: String(d.action_id), values: {}, context_id: state.clientId,
+      action_id: String(d.action_id), values: {},
+      fragment_id: (typeof d.fragment_id === "string") ? d.fragment_id : null,
+      context_id: state.clientId,
       expected_revision: 0, confirm: false, frame_token: state.frameToken });
   });
   mountFrame();

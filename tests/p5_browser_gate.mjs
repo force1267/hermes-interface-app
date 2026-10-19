@@ -241,6 +241,77 @@ try {
     }
     const draft = await ev(`document.getElementById('composer-input').value`);
     check('draft retained across reload on dead backend', draft === 'DRAFT-KEEP-DEAD', String(draft).slice(0, 40));
+  } else if (mode === 'restart') {
+    // Backend death honesty + draft lifecycle + recovery without
+    // reload. The python driver watches outPath+'.control': this mode
+    // writes 'stop' / 'start' there and waits for the driver to unlink.
+    const { existsSync: fExists } = await import('node:fs');
+    const control = outPath + '.control';
+    const command = async (op) => {
+      writeFileSync(control, op);
+      for (let i = 0; i < 300 && fExists(control); i++) await sleep(100);
+    };
+    const statusNow = async () =>
+      String(await ev(`document.getElementById('connection-status').textContent`));
+    const waitReadyR = async () => {
+      for (let i = 0; i < 90; i++) {
+        const s = await statusNow();
+        if (s.indexOf('ready') === 0) return s;
+        await sleep(1000);
+      }
+      return statusNow();
+    };
+    const status0 = await waitReadyR();
+    check('initial ready', status0.indexOf('ready') === 0, status0);
+    await ev(`document.getElementById('composer-input').value = 'Reply with exactly: ${nonce}'; document.getElementById('composer-send').click();`);
+    for (let i = 0; i < 120; i++) {
+      const arts = await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => a.querySelector('p') ? a.querySelector('p').textContent : '').join('|')`);
+      if (String(arts).indexOf(nonce) >= 0) break;
+      await sleep(1000);
+    }
+    await sleep(2000);
+    const history = await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => ({id: a.dataset.bubbleId, role: a.querySelector('strong') ? a.querySelector('strong').textContent : '', text: a.querySelector('p') ? a.querySelector('p').textContent : ''}))`);
+    report.historyBefore = history;
+    report.draftAfterCompleted = await ev(`document.getElementById('composer-input').value`);
+    check('completed send clears draft', report.draftAfterCompleted === '');
+    await ev(`document.getElementById('composer-input').value = 'INDEPENDENT-UNSENT-DRAFT'; document.getElementById('composer-input').dispatchEvent(new Event('input', {bubbles:true}));`);
+    await command('stop');
+    let dead = '', deadDis = false;
+    for (let i = 0; i < 40; i++) {
+      dead = await statusNow();
+      deadDis = await ev(`document.getElementById('composer-send').disabled`);
+      if (/unavailable/i.test(dead) && deadDis === true) break;
+      await sleep(1000);
+    }
+    report.deadStatus = dead;
+    report.deadDisabled = deadDis;
+    check('running backend death detected', /unavailable/i.test(dead) && deadDis === true, dead);
+    report.deadHistory = await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => ({id: a.dataset.bubbleId, role: a.querySelector('strong') ? a.querySelector('strong').textContent : '', text: a.querySelector('p') ? a.querySelector('p').textContent : ''}))`);
+    check('death does not fabricate or lose last good content', JSON.stringify(report.deadHistory) === JSON.stringify(history));
+    await navLoad(baseUrl + '/');
+    await sleep(2000);
+    report.deadReloadStatus = await statusNow();
+    check('reload while dead shows unavailable', /unavailable/i.test(report.deadReloadStatus), report.deadReloadStatus);
+    await command('start');
+    let back = '';
+    for (let i = 0; i < 60; i++) {
+      back = await statusNow();
+      if (back.indexOf('ready') === 0) break;
+      await sleep(1000);
+    }
+    check('restart returns ready without page reload', back.indexOf('ready') === 0, back);
+    await navLoad(baseUrl + '/');
+    await waitReadyR();
+    report.historyAfter = await ev(`Array.from(document.querySelectorAll('#bubbles article')).map((a) => ({id: a.dataset.bubbleId, role: a.querySelector('strong') ? a.querySelector('strong').textContent : '', text: a.querySelector('p') ? a.querySelector('p').textContent : ''}))`);
+    check('history IDs and content survive backend restart/reload', JSON.stringify(history) === JSON.stringify(report.historyAfter));
+    check('unsent draft survives restart/reload', (await ev(`document.getElementById('composer-input').value`)) === 'INDEPENDENT-UNSENT-DRAFT');
+    try {
+      const frameProbe = await evFrame(`Promise.all([fetch('https://example.com/').then(() => 'ALLOWED', () => 'DENIED'), Promise.resolve(document.querySelector('meta[http-equiv="Content-Security-Policy"]') ? document.querySelector('meta[http-equiv="Content-Security-Policy"]').content : 'no-meta')])`);
+      report.frameNetworkProbe = frameProbe;
+      check('frame fetch denied', frameProbe && frameProbe[0] === 'DENIED');
+    } catch (e) {
+      check('frame fetch denied', false, String(e).slice(0, 120));
+    }
   } else if (mode === 'expiry') {
     const waitReadyX = async () => {
       for (let i = 0; i < 90; i++) {
@@ -367,10 +438,36 @@ try {
       } else {
         check('frame action forwarded through domain validation', false, 'no welcome token captured');
       }
+      // Authenticated resize is clamped to the configured policy max;
+      // tokenless / context-stale / unknown-surface frame events are
+      // fenced in the parent and never forwarded or applied.
+      if (tok) {
+        await evFrame(`parent.postMessage({op:'resize', token:${JSON.stringify(tok)}, context:${JSON.stringify(fcx)}, height:5000},'*')`);
+        await sleep(500);
+        const h = await ev(`document.getElementById('frag-frame').style.height`);
+        check('frame resize clamped to configured max', h === '800px', String(h));
+      } else {
+        check('frame resize clamped to configured max', false, 'no welcome token captured');
+      }
+      const hBefore = await ev(`document.getElementById('frag-frame').style.height`);
+      const fenceBefore = await ev(`window.__chatFenceIgnored()`);
       await evFrame(`parent.postMessage({op:'resize', height:5000},'*')`);
       await sleep(500);
-      const h = await ev(`document.getElementById('frag-frame').style.height`);
-      check('frame resize clamped to configured max', h === '800px', String(h));
+      const hAfter = await ev(`document.getElementById('frag-frame').style.height`);
+      check('tokenless frame resize ignored', hAfter === hBefore, String(hBefore) + ' -> ' + String(hAfter));
+      await evFrame(`parent.postMessage({op:'form-state', fragment_id:'f-bogus', values:{x:1}},'*')`);
+      await sleep(500);
+      const fenceAfter = await ev(`window.__chatFenceIgnored()`);
+      check('tokenless frame form-state ignored', fenceAfter > fenceBefore, String(fenceBefore) + ' -> ' + String(fenceAfter));
+      if (tok) {
+        const fenceBefore2 = await ev(`window.__chatFenceIgnored()`);
+        await evFrame(`parent.postMessage({op:'form-state', token:${JSON.stringify(tok)}, context:${JSON.stringify(fcx)}, fragment_id:'f-bogus', values:{x:1}},'*')`);
+        await sleep(500);
+        const fenceAfter2 = await ev(`window.__chatFenceIgnored()`);
+        check('unknown-fragment form-state ignored', fenceAfter2 > fenceBefore2, String(fenceBefore2) + ' -> ' + String(fenceAfter2));
+      } else {
+        check('unknown-fragment form-state ignored', false, 'no welcome token captured');
+      }
     }
     // reload mid-send: second nonce, reload before completion, no dup/loss
     await ev(`document.getElementById('composer-input').value = 'Reply with only this exact line and nothing else: ACK ${nonce}-reload'; document.getElementById('composer-send').click();`);

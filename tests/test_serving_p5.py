@@ -81,7 +81,8 @@ def make_settings(tmp, provider_port, secret="svc-secret-1", **over):
             "reconnect_factor": 2, "reconnect_cap_seconds": 30,
             "reconnect_stable_seconds": 60, "draft_bytes": 65536,
             "frame_min_height": 80, "frame_max_height": 800,
-            "frame_ready_timeout_seconds": 10},
+            "frame_ready_timeout_seconds": 10,
+            "upstream_check_seconds": 1, "close_log_entries": 8},
         "auth": {
             "account_id": "mj", "password_file": pw_path,
             "cookie_name": "__Host-chat",
@@ -2026,9 +2027,12 @@ class T_S028_RuntimeConfig(ServingBase):
                         "reconnect_stable_seconds": 88,
                         "frame_min_height": 50,
                         "frame_max_height": 500,
+                        "frame_ready_timeout_seconds": 7,
+                        "close_log_entries": 5,
                         "ws_ping_seconds": 1,
                         "ws_pong_timeout_seconds": 1,
-                        "sqlite_busy_seconds": 5}})
+                        "sqlite_busy_seconds": 5},
+            "auth": {"token_bytes": 48, "csrf_bytes": 48}})
         ck = self.login()
         ws = WSClient(self, self.port, cookie=ck)
         self.addCleanup(ws.close)
@@ -2041,14 +2045,82 @@ class T_S028_RuntimeConfig(ServingBase):
         self.assertEqual(pol["reconnect_stable_seconds"], 88)
         self.assertEqual(pol["frame_min_height"], 50)
         self.assertEqual(pol["frame_max_height"], 500)
+        self.assertEqual(pol["frame_ready_timeout_seconds"], 7)
+        self.assertEqual(pol["close_log_entries"], 5)
         row = self.srv.authdb.db.execute(
             "PRAGMA busy_timeout").fetchone()
         self.assertEqual(row[0], 5000)
+        # Declared auth sizing is honored on the wire: 48-byte entropy
+        # decodes to 48 bytes everywhere tokens are minted.
+        import base64 as _b64
+
+        def _raw_len(tok):
+            return len(_b64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))
+        pre, chal = self.srv.authdb.new_preauth()
+        self.assertEqual(_raw_len(pre), 48)
+        self.assertEqual(_raw_len(chal), 48)
+        self.assertEqual(_raw_len(w["body"]["csrf"]), 48)
+        self.assertEqual(_raw_len(ck.split("=", 1)[1]), 48)
         # JS owns no numeric policy of its own
         with open(os.path.join(adaptermod.STATIC_DIR, "app.js")) as f:
             js = f.read()
         for lit in ("65536", "30000", "800", "80"):
             self.assertNotIn(lit, js)
+
+    def test_s028_json_depth_enforced(self):
+        # json_depth is a live bound, not a validated decoration:
+        # hostile nesting is rejected before dispatch.
+        self.start_stack(settings_over={
+            "adapter": {"json_depth": 8}})
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        self.assertIsNotNone(w)
+        nested = {}
+        cur = nested
+        for _ in range(100):
+            cur["n"] = {}
+            cur = cur["n"]
+        ws.send({"v": 1, "kind": "command", "request_id": "deep1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "snapshot", "body": nested})
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertIsNotNone(rej)
+        self.assertEqual(rej["body"]["code"], "bad-envelope")
+        # Ordinary commands still pass under the same bound.
+        ws.send({"v": 1, "kind": "command", "request_id": "ok1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "snapshot", "body": {}})
+        self.assertIsNotNone(ws.wait_op("snapshot", timeout=10))
+
+    def test_s028_agent_queue_bytes_enforced(self):
+        # The agent-owned queue_max_bytes (policy.file) admits writes
+        # alongside the static safety backstop; the tighter bound wins.
+        self.start_stack()
+        with open(os.path.join(self.tmp, "admission-policy.json")) as f:
+            pol = json.load(f)
+        pol["queue_max_bytes"] = 0
+        with open(os.path.join(self.tmp, "admission-policy.json"),
+                  "w") as f:
+            json.dump(pol, f)
+        self.srv._load_policy()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        ws.send({"v": 1, "kind": "command", "request_id": "q1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "queued?"}})
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertIsNotNone(rej)
+        self.assertEqual(rej["body"]["code"], "busy")
 
 
 class T_S029_FrameFocus(unittest.TestCase):
@@ -2079,6 +2151,9 @@ class T_S029_FrameFocus(unittest.TestCase):
                      "tokenless frame action ignored",
                      "frame action forwarded through domain validation",
                      "frame resize clamped to configured max",
+                     "tokenless frame resize ignored",
+                     "tokenless frame form-state ignored",
+                     "unknown-fragment form-state ignored",
                      "reconnect after reload mid-send",
                      "reload mid-send: answer arrives exactly once",
                      "socket drop reconnects with fresh welcome",
@@ -2137,6 +2212,343 @@ class T_S030_ReleaseRecovery(ServingBase):
                 adaptermod.__file__), "adapter.py")) as f:
             src = f.read()
         self.assertNotIn("delivered", src)
+
+
+class T_S031_RestartRecovery(ServingBase):
+    """Running-backend death honesty + draft lifecycle, real Chrome.
+
+    Echo-stub provider (durable HermesProvider machinery, instant
+    answers): send completes, the draft clears, the provider is stopped
+    mid-idle, the shell must go stale-disabled on its own, reload while
+    dead stays unavailable, and restart restores ready with history and
+    the unsent draft intact — no reload, no regeneration.
+    """
+
+    def _restart_stack(self):
+        self.tmp = tempfile.mkdtemp(prefix="p5r")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        stub = os.path.join(self.tmp, "echo.py")
+        with open(stub, "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import sys, json\n"
+                    "prompt = sys.stdin.read()\n"
+                    "print(json.dumps({'type': 'system', 'subtype': 'init',"
+                    " 'model': 'echo', 'session_id': 'SID-E'}))\n"
+                    "print(json.dumps({'type': 'result', 'exit_code': 0,"
+                    " 'text': 'ACK ' + prompt.strip(),"
+                    " 'session_id': 'SID-E'}))\n")
+        os.chmod(stub, 0o755)
+        self.psettings = {
+            "bind_host": "127.0.0.1", "bind_port": 0,
+            "hermes_executable": stub, "hermes_home": self.tmp,
+            "workspace": os.path.join(self.tmp, "work"),
+            "agent_timeout_seconds": 60,
+            "termination_grace_seconds": 5,
+            "output_bytes": 4194304, "stdout_line_bytes": 1048576,
+            "actions_enabled": False, "drawer_writes_enabled": False,
+            "listen_backlog": 16, "sqlite_busy_seconds": 2}
+        os.makedirs(self.psettings["workspace"], exist_ok=True)
+        self.secret = "svc-restart-1"
+        self.hp_db = os.path.join(self.tmp, "hp.sqlite3")
+        self.hp = HermesProvider(dict(self.psettings), self.hp_db,
+                                 self.secret, account_id="mj")
+        self.hp_port = self.hp.start("127.0.0.1", 0)
+        self.addCleanup(self.hp.stop)
+        spath = make_settings(
+            self.tmp, self.hp_port, secret=self.secret,
+            **{"adapter": {"upstream_check_seconds": 1}})
+        self.srv = adaptermod.AdapterServer(spath)
+        self.port = self.srv.start()
+        self.addCleanup(self.srv.stop)
+        self.srv.origin = "http://localhost:%d" % self.port
+        self.srv.host = "localhost:%d" % self.port
+        return "http://localhost:%d" % self.port
+
+    def test_s031_restart_recovery(self):
+        node, chrome = _node_chrome()
+        base = self._restart_stack()
+        userdir = tempfile.mkdtemp(prefix="p5chrome-restart")
+        self.addCleanup(shutil.rmtree, userdir, True)
+        out = os.path.join(self.tmp, "restart.json")
+        control = out + ".control"
+        nonce = "restart-p1-%s" % os.urandom(4).hex()
+        chromelog = open(os.path.join(self.tmp, "restart-chrome.log"),
+                         "w")
+        self.addCleanup(chromelog.close)
+        proc = subprocess.Popen(
+            [node, "tests/p5_browser_gate.mjs", base, chrome,
+             userdir, "restart", nonce, out, "correct-horse"],
+            stdout=chromelog, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.time() + 420
+            while proc.poll() is None and time.time() < deadline:
+                if os.path.exists(control):
+                    with open(control) as f:
+                        op = f.read().strip()
+                    try:
+                        os.unlink(control)
+                    except OSError:
+                        pass
+                    if op == "stop":
+                        self.hp.stop()
+                    elif op == "start":
+                        hp2 = HermesProvider(
+                            dict(self.psettings), self.hp_db,
+                            self.secret, account_id="mj")
+                        hp2.start("127.0.0.1", self.hp_port)
+                        self.addCleanup(hp2.stop)
+                        self.hp = hp2
+                time.sleep(0.1)
+            self.assertIsNotNone(
+                proc.poll(), "restart gate timed out waiting for chrome")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertTrue(os.path.exists(out), "restart gate report")
+        with open(out) as f:
+            rep = json.load(f)
+        for name in ("initial ready",
+                     "completed send clears draft",
+                     "running backend death detected",
+                     "death does not fabricate or lose last good content",
+                     "reload while dead shows unavailable",
+                     "restart returns ready without page reload",
+                     "history IDs and content survive backend "
+                     "restart/reload",
+                     "unsent draft survives restart/reload",
+                     "frame fetch denied"):
+            self.assertEqual(rep["checks"].get(name), "pass",
+                             "%s :: %s" % (name, rep["checks"].get(
+                                 name)))
+
+
+class T_S032_DeathCursorPins(ServingBase):
+    """Idle death push, authoritative cursor, pins, fragment fence."""
+
+    def test_s032_idle_death_and_recovery(self):
+        # No user traffic for the whole death window: the monitor must
+        # push backend-unavailable on its own, keep serving cached
+        # history, and push ready again after the provider returns.
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        self.assertIsNotNone(w)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        ws.send({"v": 1, "kind": "command", "request_id": "d1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "cache-me"}})
+        self.assertEqual(ws.wait_op("outcome", timeout=15)["body"][
+            "status"], "accepted")
+        self.assertEqual(ws.wait_op("outcome", timeout=30)["body"][
+            "status"], "completed")
+        self.provider.stop()
+        st = None
+        end = time.time() + 20
+        while time.time() < end and st is None:
+            st = ws.wait_op("status", timeout=2)
+            if st is not None and st["body"].get("state") != \
+                    "backend-unavailable":
+                st = None
+        self.assertIsNotNone(st, "idle death push without user traffic")
+        self.assertEqual(st["body"]["state"], "backend-unavailable")
+        # Cached history is still served, explicitly flagged stale.
+        ws.send({"v": 1, "kind": "command", "request_id": "d2",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "snapshot", "body": {}})
+        snap = ws.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap)
+        self.assertFalse(snap["body"]["backend_alive"])
+        self.assertTrue(any(b["text"] == "cache-me"
+                            for b in snap["body"]["bubbles"]))
+        # Provider returns on a fresh port: ready pushes itself, the
+        # page would resync without reload.
+        from p1transport import Provider as _P
+        newp = _P()
+        self.addCleanup(newp.stop)
+        self.srv.cfg["upstream"]["port"] = newp.start()
+        rdy = None
+        end = time.time() + 20
+        while time.time() < end and rdy is None:
+            rdy = ws.wait_op("status", timeout=2)
+            if rdy is not None and rdy["body"].get("state") != "ready":
+                rdy = None
+        self.assertIsNotNone(rdy, "recovery push without reload")
+        snap2 = None
+        ws.send({"v": 1, "kind": "command", "request_id": "d3",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "snapshot", "body": {}})
+        end = time.time() + 10
+        while time.time() < end and snap2 is None:
+            snap2 = ws.wait_op("snapshot", timeout=2)
+        self.assertIsNotNone(snap2)
+        self.assertTrue(snap2["body"]["backend_alive"])
+        self.assertTrue(any(b["text"] == "cache-me"
+                            for b in snap2["body"]["bubbles"]))
+
+    def test_s032_cursor_authoritative_after_reload_during_send(self):
+        # Two completed turns, the second finished while the socket was
+        # gone: the durable cursor must be the second answer, not the
+        # first, and a re-attach must project it.
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws, tab="tab-cursor")
+        self.assertIsNotNone(w)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        csrf = w["body"]["csrf"]
+        ws.send({"v": 1, "kind": "command", "request_id": "c1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": csrf,
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "one"}})
+        self.assertEqual(ws.wait_op("outcome", timeout=15)["body"][
+            "status"], "accepted")
+        self.assertEqual(ws.wait_op("outcome", timeout=30)["body"][
+            "status"], "completed")
+        ws.send({"v": 1, "kind": "command", "request_id": "c2",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": csrf,
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "two"}})
+        self.assertEqual(ws.wait_op("outcome", timeout=15)["body"][
+            "status"], "accepted")
+        ws.close()
+        cid = w["client_id"]
+        end = time.time() + 30
+        while time.time() < end:
+            rec = self.srv.clients.get(cid, {})
+            if len(rec.get("assistant", [])) >= 2:
+                break
+            time.sleep(0.1)
+        rec = self.srv.clients.get(cid, {})
+        self.assertEqual(len(rec.get("assistant", [])), 2)
+        # Fixture answers are generic acks: the provider cursor is its
+        # own counter, and the durable cursor must be the latest one,
+        # never one turn behind (stale code left "1" here).
+        self.assertEqual(rec.get("upstream_cursor"),
+                         str(self.provider.cursor))
+        ws2 = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws2.close)
+        w2 = attach(ws2, tab="tab-cursor", req="c3")
+        self.assertIsNotNone(w2)
+        snap = ws2.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["body"]["cursor"],
+                         str(self.provider.cursor))
+
+    def test_s032_pins_restored_across_restart(self):
+        # A pinned drawer page round-trips through the durable client
+        # record and survives an adapter restart (re-pin restoration).
+        from p3drawer import ops as drawer_ops
+        spath = self.start_stack()
+        seed = drawer_ops.handle_op(
+            self.srv.drawer,
+            {"op": "add", "name": "pin-me",
+             "tree": {"component": "Text",
+                      "props": {"text": "pinned page"},
+                      "children": []},
+             "kind": "text", "fallback_text": "pinned page"})
+        self.assertEqual(seed.get("status"), "ok")
+        pid = seed["drawer_entry"]
+        self.assertEqual(
+            drawer_ops.handle_op(
+                self.srv.drawer, {"op": "pin", "page_id": pid}).get(
+                "status"), "ok")
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws, tab="tab-pins")
+        self.assertIsNotNone(w)
+        snap = ws.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap)
+        self.assertIn(pid, [i["id"] for i in
+                            snap["body"]["drawer"]["items"] if
+                            i.get("pinned")])
+        rec = self.srv.clients.get(w["client_id"], {})
+        self.assertIn(pid, rec.get("pins", []))
+        ws.close()
+        self.srv.stop()
+        srv2 = adaptermod.AdapterServer(spath)
+        srv2.start()
+        self.addCleanup(srv2.stop)
+        ws2 = WSClient(self, srv2.port, cookie=ck)
+        self.addCleanup(ws2.close)
+        w2 = attach(ws2, tab="tab-pins", req="p2")
+        self.assertIsNotNone(w2)
+        snap2 = ws2.wait_op("snapshot", timeout=10)
+        self.assertIsNotNone(snap2)
+        self.assertIn(pid, [i["id"] for i in
+                            snap2["body"]["drawer"]["items"] if
+                            i.get("pinned")])
+        rec2 = srv2.clients.get(w2["client_id"], {})
+        self.assertIn(pid, rec2.get("pins", []))
+
+    def test_s032_unknown_fragment_action_rejected(self):
+        # A live channel token does not bless an unissued surface: the
+        # fragment check fails before the (disabled) action path, so the
+        # code is unknown-action rather than actions-disabled.
+        self.start_stack()
+        ck = self.login()
+        ws = WSClient(self, self.port, cookie=ck)
+        self.addCleanup(ws.close)
+        w = attach(ws)
+        self.assertIsNotNone(w)
+        conv = ws.wait_op("snapshot", timeout=10)["body"][
+            "conversation_id"]
+        ws.send({"v": 1, "kind": "command", "request_id": "g1",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "chat.send",
+                 "body": {"conversation_id": conv, "text": "surface"}})
+        self.assertEqual(ws.wait_op("outcome", timeout=15)["body"][
+            "status"], "accepted")
+        self.assertEqual(ws.wait_op("outcome", timeout=30)["body"][
+            "status"], "completed")
+        snap = None
+        ws.send({"v": 1, "kind": "command", "request_id": "g2",
+                 "client_id": w["client_id"],
+                 "generation": w["generation"], "csrf": w["body"]["csrf"],
+                 "op": "snapshot", "body": {}})
+        end = time.time() + 10
+        while time.time() < end and snap is None:
+            snap = ws.wait_op("snapshot", timeout=2)
+        self.assertIsNotNone(snap)
+        issued = [b.get("frame_payload", {}).get("fragment_id")
+                  for b in snap["body"]["bubbles"]
+                  if isinstance(b.get("frame_payload"), dict)]
+        issued = [f for f in issued if f]
+        self.assertTrue(issued)
+        base = {"v": 1, "kind": "command",
+                "client_id": w["client_id"],
+                "generation": w["generation"],
+                "csrf": w["body"]["csrf"], "op": "action.invoke"}
+        ws.send(dict(base, request_id="g3",
+                     body={"conversation_id": conv,
+                           "action_id": "a.evil", "values": {},
+                           "fragment_id": "f-not-issued",
+                           "context_id": w["client_id"],
+                           "expected_revision": 0, "confirm": False,
+                           "frame_token": w["body"]["frame_token"]}))
+        rej = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rej["body"]["code"], "unknown-action")
+        ws.send(dict(base, request_id="g4",
+                     body={"conversation_id": conv,
+                           "action_id": "a.evil", "values": {},
+                           "fragment_id": issued[0],
+                           "context_id": w["client_id"],
+                           "expected_revision": 0, "confirm": False,
+                           "frame_token": w["body"]["frame_token"]}))
+        rej2 = ws.wait_op("outcome", timeout=10)
+        self.assertEqual(rej2["body"]["code"], "unknown-action")
 
 
 if __name__ == "__main__":

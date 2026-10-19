@@ -32,7 +32,9 @@
     "draft_bytes": 65536,
     "frame_min_height": 80,
     "frame_max_height": 800,
-    "frame_ready_timeout_seconds": 10
+    "frame_ready_timeout_seconds": 10,
+    "upstream_check_seconds": 2,
+    "close_log_entries": 8
   },
   "auth": {
     "account_id": "mj",
@@ -79,7 +81,9 @@
     "output_bytes": 4194304,
     "stdout_line_bytes": 1048576,
     "actions_enabled": false,
-    "drawer_writes_enabled": false
+    "drawer_writes_enabled": false,
+    "listen_backlog": 16,
+    "sqlite_busy_seconds": 2
   },
   "policy": {
     "file": "/var/lib/interface-app/admission-policy.json"
